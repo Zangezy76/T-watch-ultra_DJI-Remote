@@ -9,6 +9,10 @@ menu "Board Selection"
 
         config BOARD_WAVESHARE_S3_LCD19
             bool "Waveshare ESP32-S3-LCD-1.9 (ESP32-S3)"
+
+        config BOARD_TWATCH_ULTRA
+            bool "LILYGO T-Watch Ultra (ESP32-S3)"
+
     endchoice
 
 endmenu
@@ -19,6 +23,7 @@ menu "GPS Configuration"
         int "UART port number for GPS"
         default 2 if BOARD_M5STACK_BASIC_V27
         default 1 if BOARD_WAVESHARE_S3_LCD19
+        default 1 if BOARD_TWATCH_ULTRA
         range 0 2
         help
             UART port number used for GPS communication.
@@ -27,6 +32,7 @@ menu "GPS Configuration"
         int "GPS UART baud rate"
         default 115200 if BOARD_M5STACK_BASIC_V27
         default 9600   if BOARD_WAVESHARE_S3_LCD19
+        default 38400  if BOARD_TWATCH_ULTRA
         help
             Baud rate for GPS UART communication.
 
@@ -34,6 +40,7 @@ menu "GPS Configuration"
         int "GPS UART TX GPIO pin"
         default 17 if BOARD_M5STACK_BASIC_V27
         default 18 if BOARD_WAVESHARE_S3_LCD19
+        default 12 if BOARD_TWATCH_ULTRA
         range 0 48
         help
             GPIO number for GPS UART TX (ESP to GPS).
@@ -42,6 +49,7 @@ menu "GPS Configuration"
         int "GPS UART RX GPIO pin"
         default 16 if BOARD_M5STACK_BASIC_V27
         default 17 if BOARD_WAVESHARE_S3_LCD19
+        default 11 if BOARD_TWATCH_ULTRA
         range 0 48
         help
             GPIO number for GPS UART RX (GPS to ESP).
