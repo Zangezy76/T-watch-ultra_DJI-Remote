@@ -1,265 +1,176 @@
-# DJI-Remote – Multi-Camera Remote Control for DJI Osmo Action Cameras
-### Powered by M5Stack Basic V2.7 (ESP32) and Waveshare ESP32-S3-LCD-1.9 (ESP32-S3)
+# DJI Osmo Action 5 Pro BLE Remote on LILYGO T-Watch Ultra
 
-![](https://img.shields.io/badge/version-V1.2.0-red.svg) ![License](https://img.shields.io/github/license/rhoenschrat/DJI-Remote) ![Platform](https://img.shields.io/badge/platform-ESP32%20%7C%20ESP32--S3-orange) ![ESP-IDF](https://img.shields.io/badge/ESP--IDF-v5.5.1-blue)
+A custom BLE remote control for DJI Osmo Action 5 Pro built on LILYGO T-Watch Ultra (ESP32-S3). Controls camera recording, injects real-time GPS data for overlay in DJI Mimo, and logs GPX tracks to SD card — all from your wrist.
 
-<img title="DJI-Remote" src="docs/images/dji-remote.jpg" alt="DJI-Reemote">
+---
 
+## ✨ Features
 
-This project provides a fully featured Bluetooth remote controller for managing up to
-**three DJI Osmo Action cameras simultaneously**, including forwarding live GPS data to all connected cameras.
+- **BLE Camera Control** — Start/stop recording with a tap
+- **GPS Injection** — Real-time coordinates sent to camera every second, GPS overlay confirmed working in DJI Mimo
+- **GPX Logger** — Track recording with waypoints (REC START/STOP, fishing spots) saved to SD card
+- **Display Sleep** — Auto-off after 1 minute, wake by wrist shake
+- **Two Touch Zones** — Upper 2/3 = camera control, lower 1/3 = logger control
 
-The remote was created out of my own need for a reliable and distraction-free way to control my multicam motovlog setup while riding — with full control and real-time status information at a glance.
+---
 
-[**More info here**](https://www.rhoenschrat.de/dji-remote/index-en.html)
-[**Demo on YouTube**](https://youtu.be/j2qDq6D7IwU)
+## 📷 Hardware
 
-It is based on:
+| Component | Details |
+|-----------|---------|
+| **Watch** | LILYGO T-Watch Ultra (ESP32-S3R8, 240MHz, BLE 5.0) |
+| **Display** | 2.01" AMOLED 410×502, CO5300 |
+| **GPS** | u-blox MIA-M10Q (built-in) |
+| **IMU** | BHI260AP (shake-to-wake) |
+| **Battery** | 1100 mAh, IP65, ~10h runtime |
+| **Camera** | DJI Osmo Action 5 Pro |
+| **Camera MAC** | 04:A8:5A:8C:BC:6C |
 
-- [**M5Stack Basic V2.7**](https://docs.m5stack.com/en/core/basic_v2.7)
-- [**M5Stack Module GPS v2.0**](https://docs.m5stack.com/en/module/Module%20GPS%20v2.0)
-- [**Waveshare ESP32-S3-LCD-1.9**](https://www.waveshare.com/esp32-s3-lcd-1.9.htm)
-- **ESP-IDF (ESP32 / ESP32-S3)**
-- **LVGL 9.5.0** (UI rendering via esp_lvgl_port)
+---
 
-Features include:
-
-- Start/Stop recording
-- Highlight tag insertion
-- Sleep/Wake control
-- Snapshot while sleeping
-- Mode switching (QS button emulation)
-- Automatic boot-time scanning & reconnection
-- Multi-camera action coordination
-- Live GPS injection to all connected cameras
-- LVGL-based UI with hardware-accelerated rendering
-- **Optional external buttons (GPIO)**
-
-
-# Supported Cameras
-
-| Camera Model | Notes |
-|--------------|-------|
-| DJI Action 4 |  |
-| DJI Action 5 Pro |  |
-| DJI Action 6 |  |
-| Osmo 360 | No highlight tags |
-
-
-# Origin and Credits
-
-This project is based on and inspired by the earlier:
-
-[**M5StickCPlus2_Remote_For_DJI_Osmo**](https://serialhobbyism.com/open-source-diy-remote-for-dji-osmo-action-5-pro-cameras)
-
-Which is based on:
-[**Osmo-GPS-Controller-Demo**](https://github.com/dji-sdk/Osmo-GPS-Controller-Demo) by DJI
-
-DJI-Remote significantly extends the concept with:
-
-- Switch to **M5Stack Basic V2.7**
-- A redesigned, larger UI
-- GPS integration
-- Multi-camera logic
-- Wake/snapshot queue processing
-
-
-# Documentation
-
-| File | Purpose |
-|------|---------|
-| [`docs/manual.md`](docs/manual.md) | **User Manual** – How to operate the remote |
-| [`docs/implementation.md`](docs/implementation.md) | **Developer Documentation** – Firmware architecture and internals |
-| [`docs/hardware-waveshare-s3-lcd19.md`](docs/hardware-waveshare-s3-lcd19.md) | **Hardware Reference** – Waveshare ESP32-S3-LCD-1.9 pin assignments and wiring |
-| [`CHANGELOG.md`](CHANGELOG.md) | **Changelog** – Full version history |
-| [`THIRD_PARTY_NOTICES.md`](THIRD_PARTY_NOTICES.md) | Licenses for DJI, ESP-IDF, LVGL, NimBLE and other external code |
-| [`LICENSE`](LICENSE) | MIT license for this project |
-
-
-# Hardware Requirements
-
-## M5Stack Basic V2.7
-
-- [**M5Stack Basic V2.7**](https://docs.m5stack.com/en/core/basic_v2.7)
-- [**M5Stack Module GPS v2.0**](https://docs.m5stack.com/en/module/Module%20GPS%20v2.0)
-- USB-C cable
-- *(Optional)* External hardware buttons using GPIO26 / GPIO21 / GPIO22
-
-## Waveshare ESP32-S3-LCD-1.9
-
-- [**Waveshare ESP32-S3-LCD-1.9**](https://www.waveshare.com/esp32-s3-lcd-1.9.htm)
-- 3 external momentary push-buttons (GPIO5 / GPIO6 / GPIO16)
-- ATGM336H (or compatible) GPS module
-- USB-C cable
-
-
-# External Buttons
-
-## M5Stack Basic V2.7 (Optional)
-
-The firmware supports **three optional external buttons**, behaving exactly like internal Buttons A, B, and C.
-
-### External Button Pin Mapping
-
-| Function | GPIO Pin | Electrical Requirements |
-|----------|----------|--------------------------|
-| External Button A (Shutter) | **GPIO26** | Internal pull-up enabled |
-| External Button B (Next / Navigation) | **GPIO21** | **External 10k pull-up required** |
-| External Button C (Options / Highlight / Sleep/Wake) | **GPIO22** | **External 10k pull-up required** |
-
-### Wiring Instructions
+## 🎮 Controls
 
 ```
-External Button A (GPIO26)
---------------------------
-GPIO26 ----[ internal pull-up ]----> 3.3V
-   |
-  [Button]
-   |
-  GND
-
-
-External Button B (GPIO21) – requires external 10k pull-up
-----------------------------------------------------------
-         +3.3V
-           |
-         [10k]
-           |
-GPIO21 ----+---------[Button]---------> GND
-
-
-External Button C (GPIO22) – requires external 10k pull-up
-----------------------------------------------------------
-         +3.3V
-           |
-         [10k]
-           |
-GPIO22 ----+---------[Button]---------> GND
+┌─────────────────────────┐
+│  08:42 UTC    ● REC     │
+│                         │  ← TAP = start/stop recording
+│    55.79567             │    DOUBLE TAP = connect camera
+│    37.80550             │
+│  5.4 km/h   230 m       │
+│  Cam: OK   Sat: 8       │
+├─────────────────────────┤
+│  ▶ LOG: ON              │  ← LONG TAP = start/stop GPX logger
+│  Bat: 94%    SD: OK     │    DOUBLE TAP = save waypoint (BITE)
+└─────────────────────────┘
 ```
 
-### Enabling / Disabling External Button Support
+| Action | Zone | Result |
+|--------|------|--------|
+| Tap | Upper (2/3) | Start / Stop recording |
+| Double tap | Upper (2/3) | Connect to camera |
+| Long tap | Lower (1/3) | Start / Stop GPX logger |
+| Double tap | Lower (1/3) | Save waypoint "BITE N" |
+| Wrist shake | — | Wake display |
 
-External buttons are controlled at build-time via:
+---
 
+## 📡 DJI BLE Protocol
+
+Reverse-engineered from the original [DJI-Remote](https://github.com/Zangezy76/DJI-Remote) project (ESP-IDF).
+
+**Frame format:**
 ```
-UI_ENABLE_EXTERNAL_BUTTONS
-```
-
-Located in `main/ui.c`.
-
-**Enabled (default):**
-- GPIO26 / GPIO21 / GPIO22 configured as inputs with interrupts
-- External and internal buttons work in parallel
-
-**Disabled:**
-- External buttons are ignored
-- Only the internal M5Stack buttons remain active
-
-## Waveshare ESP32-S3-LCD-1.9 (Required)
-
-The Waveshare board has no built-in user buttons. Three external momentary
-push-buttons are required and connect directly between the GPIO pin and GND.
-Internal pull-ups are enabled — no external resistors needed.
-
-| Function | GPIO Pin | Electrical Requirements |
-|----------|----------|--------------------------|
-| Button A (Shutter) | **GPIO5** | Internal pull-up enabled |
-| Button B (Next / Navigation) | **GPIO6** | Internal pull-up enabled |
-| Button C (Options / Highlight / Sleep/Wake) | **GPIO16** | Internal pull-up enabled |
-
-See [`docs/hardware-waveshare-s3-lcd19.md`](docs/hardware-waveshare-s3-lcd19.md)
-for the full wiring diagram and GPS module connection.
-
-
-# Building the Firmware (ESP-IDF)
-
-## 1. Install ESP-IDF
-
-Follow the official guide:
-https://docs.espressif.com/projects/esp-idf/en/latest/esp32/
-
-Export environment:
-
-```bash
-. $HOME/esp/esp-idf/export.sh
+[AA][LEN_LO][LEN_HI][CMD_TYPE][ENC][RES×3][SEQ_LO][SEQ_HI][CRC16×2][CMD_SET][CMD_ID][DATA][CRC32×4]
 ```
 
-## 2. Build for M5Stack Basic V2.7 (ESP32)
+| Command | CMD_SET | CMD_ID | Notes |
+|---------|---------|--------|-------|
+| Start recording | 0x1D | 0x03 | device_id + 0x00 |
+| Stop recording | 0x1D | 0x03 | device_id + 0x01 |
+| GPS injection | 0x00 | 0x17 | 45 bytes struct |
+| Switch mode | 0x1D | 0x04 | Video/Photo/Night/etc |
 
-```bash
-idf.py fullclean
-idf.py set-target esp32
-cp sdkconfig.defaults.m5stack_basic_v27 sdkconfig.defaults
-idf.py build
+- **CRC16:** DJI Fletcher, init=0x3AA3
+- **CRC32:** DJI Fletcher, init=0x00003AA3
+- **BLE Service:** 0xFFF0 | Write: 0xFFF3 | Notify: 0xFFF4
+
+---
+
+## 📂 GPX Output
+
+One file per day on SD card:
+
+```
+/track_2026_05_24.gpx   ← track points every minute
+/log_2026_05_24.txt     ← event log with timestamps
 ```
 
-## 3. Build for Waveshare ESP32-S3-LCD-1.9 (ESP32-S3)
-
-```bash
-idf.py fullclean
-idf.py set-target esp32s3
-cp sdkconfig.defaults.waveshare_s3_lcd19 sdkconfig.defaults
-idf.py build
+**Track point:**
+```xml
+<trkpt lat="55.795849" lon="37.804908">
+    <ele>5.0</ele>
+    <time>2026-05-24T07:23:15Z</time>
+    <speed>2.1</speed>
+</trkpt>
 ```
 
-## 4. Flash
-
-Linux/macOS:
-```bash
-idf.py -p /dev/ttyUSB0 flash monitor
+**Waypoint (fishing spot / REC markers):**
+```xml
+<wpt lat="55.795849" lon="37.804908">
+    <time>2026-05-24T07:23:15Z</time>
+    <name>BITE 1</name>
+</wpt>
 ```
 
-Windows:
-```cmd
-idf.py -p COM3 flash monitor
+---
+
+## 🛠 Installation
+
+### Requirements
+
+- Arduino IDE 2.x
+- Board: **esp32 by Espressif Systems 3.3.8**
+- Board config: **LILYGO T-Watch Ultra**
+
+### Libraries (exact versions required)
+
+| Library | Version | Source |
+|---------|---------|--------|
+| LilyGoLib | 0.1.0 | [github.com/Xinyuan-LilyGO/LilyGoLib](https://github.com/Xinyuan-LilyGO/LilyGoLib) |
+| SensorLib | 0.3.3 | LilyGoLib-ThirdParty ⚠️ do not update |
+| RadioLib | 7.4.0 | LilyGoLib-ThirdParty ⚠️ do not update |
+| lvgl | 9.4.0 | LilyGoLib-ThirdParty ⚠️ do not update |
+| NimBLE-Arduino | 2.5.0 | Arduino Library Manager |
+| TinyGPSPlus | built-in | Part of LilyGoLib |
+| NFC-RFAL-fork | 1.0.1 | [github.com/lewisxhe/NFC-RFAL-fork](https://github.com/lewisxhe/NFC-RFAL-fork) |
+| ST25R3916-fork | 1.1.0 | [github.com/lewisxhe/ST25R3916-fork](https://github.com/lewisxhe/ST25R3916-fork) |
+
+### Flash
+
+1. Open `arduino/step6_gps_injection/step6_gps_injection.ino` in Arduino IDE
+2. Select board: **LILYGO T-Watch Ultra (SX1262)**
+3. Set your camera MAC address in the sketch:
+```cpp
+static const char* CAMERA_MAC = "04:a8:5a:8c:bc:6c";
+```
+4. Upload via COM port (auto-detected, no button press needed)
+
+---
+
+## 📁 Repository Structure
+
+```
+DJI-Remote/
+├── arduino/
+│   └── step6_gps_injection/    ← Main Arduino sketch
+├── protocol/                   ← DJI BLE protocol (ESP-IDF, C)
+├── ble/                        ← BLE layer
+├── logic/                      ← Command logic
+├── utils/crc/                  ← CRC16/CRC32 implementation
+├── docs/                       ← Documentation & images
+├── WORKING_LIBRARIES.md        ← Verified library versions
+└── README.md
 ```
 
+---
 
-# Web Flash (Easiest)
+## 🔑 Key Technical Notes
 
-Both targets are flashed via [espflash.app](https://espflash.app)
-(Chrome or Edge required). Download the correct binary for your hardware from
-the [latest release](https://github.com/rhoenschrat/DJI-Remote/releases/latest):
+- **GPS:** Use `instance.gps` (LilyGoLib), do **not** create `HardwareSerial` manually
+- **BLE:** All BLE operations in a FreeRTOS task — calling `connect()` from `setup()` hangs the system
+- **LVGL:** Update UI via flags from BLE task, never directly
+- **Display:** 2.01" AMOLED has rounded corners — keep content 50px+ from edges
 
-- `dji-remote-v1.2.0-m5stack-basic-v27.bin` — for M5Stack Basic V2.7
-- `dji-remote-v1.2.0-waveshare-s3-lcd19.bin` — for Waveshare ESP32-S3-LCD-1.9
+---
 
-Select the port, load the `.bin` file, and flash — no toolchain required.
+## 📜 Background
 
+This project started as a fork of [DJI-Remote](https://github.com/nicholaswilde/DJI-Remote) (ESP-IDF). The protocol was reverse-engineered from that codebase. The Arduino/LilyGoLib port was built from scratch to run on the T-Watch Ultra wristwatch.
 
-# Highlight Features
+Use case: fishing from a boat — camera mounted on the boat, watch on wrist. One tap starts recording, GPS coordinates are overlaid on the video in DJI Mimo, and the route is logged as a GPX track.
 
-- Complete multi-camera support
-- Snapshot-while-sleeping
-- Highlight tag synchronization
-- Automatic GPS forwarding
-- Accurate status monitoring (1D02 / 1D06)
-- Robust wake/retry logic
-- Smart autoconnect boot behavior
+---
 
+## 📄 License
 
-# License
-
-This project is licensed under the **MIT License**.
-See [`LICENSE`](LICENSE).
-
-Third-party licenses (DJI, ESP-IDF, MIT legacy) are listed in:
-
-[`THIRD_PARTY_NOTICES.md`](THIRD_PARTY_NOTICES.md)
-
-
-# Acknowledgements
-
-Thanks to:
-
-- The creator of the [**M5StickCPlus2_Remote_For_DJI_Osmo**](https://github.com/theserialhobbyist/M5StickCPlus2_Remote_For_DJI_Osmo) project
-- DJI for the [**Osmo-GPS-Controller-Demo**](https://github.com/dji-sdk/Osmo-GPS-Controller-Demo)
-- Espressif for ESP-IDF
-- The open-source community
-
-
-# Feedback
-
-Issues and feature requests are welcome on GitHub.
-
-<a href="https://www.buymeacoffee.com/rhoenschrat" target="_blank"><img src="https://cdn.buymeacoffee.com/buttons/v2/default-yellow.png" alt="Buy Me A Coffee" style="height: 60px !important;width: 217px !important;" ></a>
+MIT

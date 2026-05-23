@@ -1,10 +1,25 @@
-*.o
-*.log
-.vscode
+# Build outputs
 /build
 /managed_components
-.DS_Store
-sdkconfig.old
-/release
-/.cache
 /components
+/.cache
+/release
+
+# Compiled object/binary artifacts
+*.o
+*.log
+*.a
+*.elf
+*.bin
+*.map
+*.d
+
+# ESP-IDF generated config
+sdkconfig
+sdkconfig.old
+dependencies.lock
+
+# IDE / OS
+.vscode
+.DS_Store
+Thumbs.db

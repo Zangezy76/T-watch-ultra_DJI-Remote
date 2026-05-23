@@ -165,7 +165,6 @@ void wakeDisplay() {
         instance.setBrightness(200);
     }
     lastActivityMs = millis();
-    Serial.printf("[WAKE] lastActivity reset, displayOn=%d\n", displayOn);
 }
 
 // ═══════════════════════════════════════════════════════════
@@ -341,6 +340,7 @@ void handleTouchEnd(int16_t x, int16_t y, uint32_t duration) {
     lastTouchMs=millis();
 
     if(y < ZONE_SPLIT) {
+        // ── Верхняя зона: камера ─────────────────────────
         if(duration < 600) {
             static uint32_t lastTopTapMs = 0;
             static int topTapCount = 0;
@@ -362,10 +362,39 @@ void handleTouchEnd(int16_t x, int16_t y, uint32_t duration) {
             }
         }
     } else {
+        // ── Нижняя зона: логгер ───────────────────────────
         if(duration >= 600) {
+            // Долгий тап → логгер
             toggleLogger();
         } else {
-            instance.setHapticEffects(1); instance.vibrator();
+            // Короткий тап — детектируем двойной
+            static uint32_t lastBotTapMs = 0;
+            static int botTapCount = 0;
+            if(millis()-lastBotTapMs < 400) botTapCount++;
+            else botTapCount = 1;
+            lastBotTapMs = millis();
+
+            if(botTapCount >= 2) {
+                botTapCount = 0;
+                // Двойной тап → вейпоинт клёва
+                static int biteCount = 0;
+                biteCount++;
+                char name[16];
+                snprintf(name, sizeof(name), "BITE %d", biteCount);
+                gpxWriteWaypoint(name);
+                // Три коротких вибрации
+                for(int i=0;i<3;i++){
+                    instance.setHapticEffects(14);
+                    instance.vibrator();
+                    delay(150);
+                }
+                logWritef("Waypoint: %s %.5f,%.5f", name,
+                    instance.gps.location.lat(),
+                    instance.gps.location.lng());
+            } else {
+                // Одиночный тап — подсказка
+                instance.setHapticEffects(1); instance.vibrator();
+            }
         }
     }
 }
@@ -474,7 +503,6 @@ void setup(){
 
     if(instance.getDeviceProbe() & HW_BHI260AP_ONLINE){
         accel.enable(25.0f, 0);
-        Serial.println("[IMU] Accel enabled");
     }
 
     sdReady=SD.exists("/");
@@ -572,7 +600,6 @@ if(displayOn && millis()-lastActivityMs>DISPLAY_TIMEOUT_MS){
     displayOn=false;
     sleepStartMs=millis();
     instance.setBrightness(0);
-    Serial.println("[SLEEP]");
 }
 
 // Пробуждение по встряхиванию — только после 2 сек сна
@@ -582,7 +609,6 @@ if(!displayOn && millis()-sleepStartMs>2000 && accel.hasUpdated()){
     float mag=sqrtf(x*x+y*y+z*z);
     float delta=fabsf(mag-prevAccelMag);
     prevAccelMag=mag;
-    Serial.printf("[ACCEL] mag=%.1f delta=%.1f\n", mag, delta);
     if(delta>3.0f){
         wakeDisplay();
     }
