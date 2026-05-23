@@ -12,6 +12,8 @@ A custom BLE remote control for DJI Osmo Action 5 Pro built on LILYGO T-Watch Ul
 - **Display Sleep** — Auto-off after 1 minute, wake by wrist shake
 - **Two Touch Zones** — Upper 2/3 = camera control, lower 1/3 = logger control
 
+![GPS Overlay in DJI Mimo](docs/images/mimo_overlay.jpg)
+![T-Watch Ultra UI](docs/images/watch_ui.jpg)
 ---
 
 ## 📷 Hardware
@@ -24,7 +26,7 @@ A custom BLE remote control for DJI Osmo Action 5 Pro built on LILYGO T-Watch Ul
 | **IMU** | BHI260AP (shake-to-wake) |
 | **Battery** | 1100 mAh, IP65, ~10h runtime |
 | **Camera** | DJI Osmo Action 5 Pro |
-| **Camera MAC** | 04:A8:5A:8C:BC:6C |
+| **Camera MAC** | See `arduino/step6_gps_injection/step6_gps_injection.ino` |
 
 ---
 
