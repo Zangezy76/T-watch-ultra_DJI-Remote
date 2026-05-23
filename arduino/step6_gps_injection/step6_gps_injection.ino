@@ -1,27 +1,29 @@
 #include <LilyGoLib.h>
 #include <LV_Helper.h>
 #include <NimBLEDevice.h>
-#include <TinyGPSPlus.h>
 #include <SD.h>
 #include <FS.h>
 
 static const char* CAMERA_MAC   = "04:a8:5a:8c:bc:6c";
 static const uint32_t DEVICE_ID = 0x00000015;
 
-TinyGPSPlus gps;
-HardwareSerial gpsSerial(1);
-
 #define TRKSEG_CLOSE     "    </trkseg>\n  </trk>\n"
 #define GPX_CLOSE        "</gpx>\n"
 #define TRKSEG_CLOSE_LEN 22
 #define GPX_CLOSE_LEN    7
 #define FULL_CLOSE_LEN   29
-
-static char    gpxPath[32]  = "";
-static int     lastGpxDay   = -1;
-static bool    sdReady       = false;
+static char  gpxPath[32] = "";
+static int   lastGpxDay  = -1;
+static bool  sdReady     = false;
 static uint32_t lastTrackMs = 0;
 #define TRACK_INTERVAL_MS 60000UL
+
+static char logPath[32] = "";
+static int  lastLogDay  = -1;
+static uint32_t startMs = 0;
+static bool firstFix    = false;
+static uint32_t lastBatLogMs = 0;
+#define BAT_LOG_INTERVAL_MS 1800000UL
 
 static lv_obj_t* lblTime   = nullptr;
 static lv_obj_t* lblRec    = nullptr;
@@ -32,11 +34,11 @@ static lv_obj_t* lblCamera = nullptr;
 
 static NimBLEClient*               pClient   = nullptr;
 static NimBLERemoteCharacteristic* pWriteChr = nullptr;
-static bool    connected   = false;
-static bool    isRecording = false;
-static uint16_t seqNum     = 0;
+static bool    connected     = false;
+static bool    isRecording   = false;
+static uint16_t seqNum       = 0;
+static bool    triggerConnect = false;  // двойной тап
 
-static uint32_t lastGpsPush  = 0;
 static uint32_t lastUiUpdate = 0;
 static uint32_t lastTouchMs  = 0;
 
@@ -79,7 +81,6 @@ uint16_t dji_crc16(const uint8_t* d, size_t l) {
     while(l--){uint8_t i=(crc^*d++)&0xFF;crc=(crc16_table[i]^(crc>>8))&0xFFFF;}
     return crc;
 }
-
 static const uint32_t crc32_table[256] = {
     0x00000000,0x77073096,0xee0e612c,0x990951ba,0x076dc419,0x706af48f,0xe963a535,0x9e6495a3,
     0x0edb8832,0x79dcb8a4,0xe0d5e91e,0x97d2d988,0x09b64c2b,0x7eb17cbd,0xe7b82d07,0x90bf1d91,
@@ -137,6 +138,33 @@ size_t dji_build_frame(uint8_t* buf, uint8_t cmd_set, uint8_t cmd_id,
     return off;
 }
 
+void logWrite(const char* msg) {
+    Serial.println(msg);
+    if(!sdReady) return;
+    if(instance.gps.date.isValid()&&instance.gps.date.day()!=lastLogDay){
+        lastLogDay=instance.gps.date.day();
+        snprintf(logPath,sizeof(logPath),"/log_%04d_%02d_%02d.txt",
+            instance.gps.date.year(),instance.gps.date.month(),instance.gps.date.day());
+    }
+    if(logPath[0]=='\0') snprintf(logPath,sizeof(logPath),"/log_nodate.txt");
+    File f=SD.open(logPath,FILE_APPEND);
+    if(!f) return;
+    if(instance.gps.time.isValid())
+        f.printf("[%02d:%02d:%02d] %s\n",
+            instance.gps.time.hour(),instance.gps.time.minute(),
+            instance.gps.time.second(),msg);
+    else f.printf("[%08lu] %s\n",millis(),msg);
+    f.close();
+}
+
+void logWritef(const char* fmt,...) {
+    char buf[128];
+    va_list args; va_start(args,fmt);
+    vsnprintf(buf,sizeof(buf),fmt,args);
+    va_end(args);
+    logWrite(buf);
+}
+
 void sendRecordCommand(bool start) {
     if(!pWriteChr||!connected) return;
     uint8_t payload[9];
@@ -146,107 +174,105 @@ void sendRecordCommand(bool start) {
     payload[5]=payload[6]=payload[7]=payload[8]=0x00;
     uint8_t frame[64];
     size_t len=dji_build_frame(frame,0x1D,0x03,payload,sizeof(payload),++seqNum);
-    pWriteChr->writeValue(frame,len,false);
+    bool ok=pWriteChr->writeValue(frame,len,false);
+    logWritef("REC %s: %s",start?"START":"STOP",ok?"OK":"FAIL");
 }
 
 void sendGpsData() {
     if(!pWriteChr||!connected) return;
-    if(!gps.location.isValid()||!gps.date.isValid()||!gps.time.isValid()) return;
-    if(gps.satellites.value()==0) return;
+    if(!instance.gps.location.isValid()||!instance.gps.date.isValid()||!instance.gps.time.isValid()) return;
+    if(instance.gps.satellites.value()==0) return;
     uint8_t payload[45]; memset(payload,0,sizeof(payload)); uint8_t* p=payload;
-    int32_t ymd=gps.date.year()*10000+gps.date.month()*100+gps.date.day();
+    int32_t ymd=instance.gps.date.year()*10000+instance.gps.date.month()*100+instance.gps.date.day();
     memcpy(p,&ymd,4); p+=4;
-    int32_t hms=gps.time.hour()*10000+gps.time.minute()*100+gps.time.second();
+    int32_t hms=instance.gps.time.hour()*10000+instance.gps.time.minute()*100+instance.gps.time.second();
     memcpy(p,&hms,4); p+=4;
-    int32_t lon=(int32_t)(gps.location.lng()*1e7); memcpy(p,&lon,4); p+=4;
-    int32_t lat=(int32_t)(gps.location.lat()*1e7); memcpy(p,&lat,4); p+=4;
-    int32_t alt=gps.altitude.isValid()?(int32_t)(gps.altitude.meters()*1000.0f):0;
+    int32_t lon=(int32_t)(instance.gps.location.lng()*1e7); memcpy(p,&lon,4); p+=4;
+    int32_t lat=(int32_t)(instance.gps.location.lat()*1e7); memcpy(p,&lat,4); p+=4;
+    int32_t alt=instance.gps.altitude.isValid()?(int32_t)(instance.gps.altitude.meters()*1000.0f):0;
     memcpy(p,&alt,4); p+=4;
-    float spd=gps.speed.isValid()?(float)gps.speed.mps():0.0f;
-    float crs=gps.course.isValid()?(float)(gps.course.deg()*3.14159265f/180.0f):0.0f;
+    float spd=instance.gps.speed.isValid()?(float)instance.gps.speed.mps():0.0f;
+    float crs=instance.gps.course.isValid()?(float)(instance.gps.course.deg()*3.14159265f/180.0f):0.0f;
     float sn=spd*cosf(crs)*100.0f,se=spd*sinf(crs)*100.0f,sd=0.0f;
     memcpy(p,&sn,4); p+=4; memcpy(p,&se,4); p+=4; memcpy(p,&sd,4); p+=4;
     float va=2.0f,ha=2.0f,sa=0.1f;
     memcpy(p,&va,4); p+=4; memcpy(p,&ha,4); p+=4; memcpy(p,&sa,4); p+=4;
-    *p=(uint8_t)gps.satellites.value();
+    *p=(uint8_t)instance.gps.satellites.value();
     uint8_t frame[80];
     size_t len=dji_build_frame(frame,0x00,0x17,payload,sizeof(payload),++seqNum);
-    pWriteChr->writeValue(frame,len,false);
+    bool ok=pWriteChr->writeValue(frame,len,false);
+    if(!ok) logWrite("GPS inject FAIL");
 }
 
 void gpxCreateFile(const char* path) {
     File f=SD.open(path,FILE_WRITE);
-    if(!f){Serial.printf("[GPX] Failed: %s\n",path);return;}
+    if(!f){logWritef("GPX create FAIL: %s",path);return;}
     f.printf("<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n");
     f.printf("<gpx version=\"1.1\" creator=\"TWatch-DJI\">\n");
     f.printf("  <trk>\n    <name>%04d-%02d-%02d</name>\n    <trkseg>\n",
-        gps.date.year(),gps.date.month(),gps.date.day());
-    f.print(TRKSEG_CLOSE);
-    f.print(GPX_CLOSE);
-    f.close();
-    Serial.printf("[GPX] Created: %s\n",path);
+        instance.gps.date.year(),instance.gps.date.month(),instance.gps.date.day());
+    f.print(TRKSEG_CLOSE); f.print(GPX_CLOSE); f.close();
+    logWritef("GPX created: %s",path);
 }
 
 void gpxCheckDay() {
-    if(!sdReady||!gps.date.isValid()) return;
-    if(gps.date.day()==lastGpxDay) return;
-    lastGpxDay=gps.date.day();
+    if(!sdReady||!instance.gps.date.isValid()) return;
+    if(instance.gps.date.day()==lastGpxDay) return;
+    lastGpxDay=instance.gps.date.day();
     snprintf(gpxPath,sizeof(gpxPath),"/track_%04d_%02d_%02d.gpx",
-        gps.date.year(),gps.date.month(),gps.date.day());
+        instance.gps.date.year(),instance.gps.date.month(),instance.gps.date.day());
     if(!SD.exists(gpxPath)) gpxCreateFile(gpxPath);
-    else Serial.printf("[GPX] Using: %s\n",gpxPath);
+    else logWritef("GPX using: %s",gpxPath);
 }
 
 void gpxWriteTrackPoint() {
-    if(!sdReady||gpxPath[0]=='\0'||!gps.location.isValid()) return;
+    if(!sdReady||gpxPath[0]=='\0'||!instance.gps.location.isValid()) return;
     File f=SD.open(gpxPath,FILE_WRITE);
-    if(!f) return;
+    if(!f){logWrite("GPX trkpt FAIL");return;}
     uint32_t size=f.size();
     if(size<FULL_CLOSE_LEN){f.close();return;}
     f.seek(size-FULL_CLOSE_LEN);
     f.printf("      <trkpt lat=\"%.6f\" lon=\"%.6f\">\n",
-        gps.location.lat(),gps.location.lng());
+        instance.gps.location.lat(),instance.gps.location.lng());
     f.printf("        <ele>%.1f</ele>\n",
-        gps.altitude.isValid()?gps.altitude.meters():0.0);
+        instance.gps.altitude.isValid()?instance.gps.altitude.meters():0.0);
     f.printf("        <time>%04d-%02d-%02dT%02d:%02d:%02dZ</time>\n",
-        gps.date.year(),gps.date.month(),gps.date.day(),
-        gps.time.hour(),gps.time.minute(),gps.time.second());
-    if(gps.speed.isValid())
-        f.printf("        <speed>%.2f</speed>\n",gps.speed.mps());
+        instance.gps.date.year(),instance.gps.date.month(),instance.gps.date.day(),
+        instance.gps.time.hour(),instance.gps.time.minute(),instance.gps.time.second());
+    if(instance.gps.speed.isValid())
+        f.printf("        <speed>%.2f</speed>\n",instance.gps.speed.mps());
     f.printf("      </trkpt>\n");
-    f.print(TRKSEG_CLOSE);
-    f.print(GPX_CLOSE);
-    f.close();
-    Serial.printf("[GPX] trkpt: %.5f, %.5f\n",gps.location.lat(),gps.location.lng());
+    f.print(TRKSEG_CLOSE); f.print(GPX_CLOSE); f.close();
 }
 
 void gpxWriteWaypoint(const char* name) {
-    if(!sdReady||gpxPath[0]=='\0'||!gps.location.isValid()) return;
+    if(!sdReady||gpxPath[0]=='\0'||!instance.gps.location.isValid()) return;
     File f=SD.open(gpxPath,FILE_WRITE);
-    if(!f) return;
+    if(!f){logWritef("GPX wpt FAIL: %s",name);return;}
     uint32_t size=f.size();
     if(size<GPX_CLOSE_LEN){f.close();return;}
     f.seek(size-GPX_CLOSE_LEN);
     f.printf("  <wpt lat=\"%.6f\" lon=\"%.6f\">\n",
-        gps.location.lat(),gps.location.lng());
+        instance.gps.location.lat(),instance.gps.location.lng());
     f.printf("    <ele>%.1f</ele>\n",
-        gps.altitude.isValid()?gps.altitude.meters():0.0);
+        instance.gps.altitude.isValid()?instance.gps.altitude.meters():0.0);
     f.printf("    <time>%04d-%02d-%02dT%02d:%02d:%02dZ</time>\n",
-        gps.date.year(),gps.date.month(),gps.date.day(),
-        gps.time.hour(),gps.time.minute(),gps.time.second());
+        instance.gps.date.year(),instance.gps.date.month(),instance.gps.date.day(),
+        instance.gps.time.hour(),instance.gps.time.minute(),instance.gps.time.second());
     f.printf("    <name>%s</name>\n",name);
     f.printf("  </wpt>\n");
-    f.print(GPX_CLOSE);
-    f.close();
-    Serial.printf("[GPX] wpt: %s\n",name);
+    f.print(GPX_CLOSE); f.close();
+    logWritef("GPX wpt: %s",name);
 }
 
 void toggleRecording() {
+    // Вибрация всегда
+    instance.setHapticEffects(14);
+    instance.vibrator();
     if(!connected||!pWriteChr) return;
     isRecording=!isRecording;
     sendRecordCommand(isRecording);
     gpxWriteWaypoint(isRecording?"REC START":"REC STOP");
-    instance.setHapticEffects(14); instance.vibrator();
     if(!isRecording){delay(200);instance.setHapticEffects(14);instance.vibrator();}
     if(isRecording){
         lv_label_set_text(lblRec,"● REC");
@@ -257,37 +283,75 @@ void toggleRecording() {
     }
 }
 
+// ═══════════════════════════════════════════════════════════
+// Обработка тапов: одиночный = запись, двойной = коннект
+// ═══════════════════════════════════════════════════════════
+void handleTouch() {
+    static uint32_t lastTapMs = 0;
+    static int tapCount = 0;
+    uint32_t now = millis();
+
+    if (now - lastTapMs < 400) {
+        tapCount++;
+    } else {
+        tapCount = 1;
+    }
+    lastTapMs = now;
+
+    if (tapCount >= 2) {
+        tapCount = 0;
+        if (!connected) {
+            // Двойной тап — подключиться к камере
+            triggerConnect = true;
+            instance.setHapticEffects(7);
+            instance.vibrator();
+            delay(100);
+            instance.setHapticEffects(7);
+            instance.vibrator();
+            lv_label_set_text(lblCamera, "Cam: connecting...");
+            logWrite("Double tap: connecting...");
+        }
+    } else {
+        // Одиночный тап — запись
+        toggleRecording();
+    }
+}
+
 void updateUI() {
     char buf[128];
-    if(gps.time.isValid())
-        snprintf(buf,sizeof(buf),"%02d:%02d UTC",gps.time.hour(),gps.time.minute());
+    if(instance.gps.time.isValid())
+        snprintf(buf,sizeof(buf),"%02d:%02d UTC",
+            instance.gps.time.hour(),instance.gps.time.minute());
     else snprintf(buf,sizeof(buf),"--:--");
     lv_label_set_text(lblTime,buf);
 
-    if(gps.location.isValid()){
+    if(instance.gps.location.isValid()){
         lv_obj_set_style_text_color(lblCoords,lv_color_white(),0);
-        snprintf(buf,sizeof(buf),"%.5f\n%.5f",gps.location.lat(),gps.location.lng());
+        snprintf(buf,sizeof(buf),"%.5f\n%.5f",
+            instance.gps.location.lat(),instance.gps.location.lng());
     } else {
         lv_obj_set_style_text_color(lblCoords,lv_palette_main(LV_PALETTE_YELLOW),0);
         snprintf(buf,sizeof(buf),"GPS\nconnecting...");
     }
     lv_label_set_text(lblCoords,buf);
 
-    if(gps.location.isValid())
+    if(instance.gps.location.isValid())
         snprintf(buf,sizeof(buf),"%.1f km/h   %.0f m",
-            gps.speed.isValid()?(float)gps.speed.kmph():0.0f,
-            gps.altitude.isValid()?(float)gps.altitude.meters():0.0f);
+            instance.gps.speed.isValid()?(float)instance.gps.speed.kmph():0.0f,
+            instance.gps.altitude.isValid()?(float)instance.gps.altitude.meters():0.0f);
     else snprintf(buf,sizeof(buf),"-- km/h   -- m");
     lv_label_set_text(lblSpeed,buf);
 
     snprintf(buf,sizeof(buf),"Watch: %d%%  Sat: %d  SD: %s",
         instance.pmu.getBatteryPercent(),
-        gps.satellites.isValid()?(int)gps.satellites.value():0,
+        (int)instance.gps.satellites.value(),
         sdReady?"OK":"--");
     lv_label_set_text(lblBat,buf);
 
-    snprintf(buf,sizeof(buf),connected?"Cam: OK  %s":"Cam: connecting...",
-        gpxPath[0]?gpxPath+1:"no gpx");
+    if(connected)
+        snprintf(buf,sizeof(buf),"Cam: OK  %s",gpxPath[0]?gpxPath+1:"no gpx");
+    else
+        snprintf(buf,sizeof(buf),"Cam: -- (2x tap)");
     lv_label_set_text(lblCamera,buf);
 }
 
@@ -296,29 +360,86 @@ class CameraCallbacks : public NimBLEClientCallbacks {
         connected=false; isRecording=false; pWriteChr=nullptr;
         lv_label_set_text(lblRec,"●");
         lv_obj_set_style_text_color(lblRec,lv_palette_darken(LV_PALETTE_GREY,2),0);
+        lv_label_set_text(lblCamera,"Cam: -- (2x tap)");
+        logWritef("BLE disconnected, reason=%d",reason);
     }
 };
 
+// ═══════════════════════════════════════════════════════════
+// BLE Task — ждёт двойного тапа, подключается, GPS инъекция
+// ═══════════════════════════════════════════════════════════
 void bleTask(void* pvParameters) {
     vTaskDelay(2000/portTICK_PERIOD_MS);
     NimBLEDevice::init("TWatch-DJI");
     NimBLEDevice::setPower(3);
     NimBLEDevice::setMTU(512);
-    pClient=NimBLEDevice::createClient();
-    pClient->setClientCallbacks(new CameraCallbacks(),false);
-    pClient->setConnectTimeout(10000);
-    NimBLEAddress addr(std::string(CAMERA_MAC),BLE_ADDR_PUBLIC);
-    if(!pClient->connect(addr)){vTaskDelete(NULL);return;}
-    auto svc=pClient->getService("0000fff0-0000-1000-8000-00805f9b34fb");
-    if(!svc){pClient->disconnect();vTaskDelete(NULL);return;}
-    pWriteChr=svc->getCharacteristic("0000fff3-0000-1000-8000-00805f9b34fb");
-    if(!pWriteChr){pClient->disconnect();vTaskDelete(NULL);return;}
-    auto nc=svc->getCharacteristic("0000fff4-0000-1000-8000-00805f9b34fb");
-    if(nc&&nc->canNotify()){
-        nc->subscribe(true,[](NimBLERemoteCharacteristic* c,uint8_t* data,size_t len,bool isNotify){});
+    NimBLEAddress addr(std::string(CAMERA_MAC), BLE_ADDR_PUBLIC);
+
+    while (true) {
+        // Ждём двойного тапа
+        logWrite("Waiting double tap to connect...");
+        while (!triggerConnect) {
+            vTaskDelay(200/portTICK_PERIOD_MS);
+        }
+        triggerConnect = false;
+
+        // Попытка подключения
+        pClient = NimBLEDevice::createClient();
+        pClient->setClientCallbacks(new CameraCallbacks(), false);
+        pClient->setConnectTimeout(10000);
+
+        logWrite("BLE connecting...");
+
+        if (!pClient->connect(addr)) {
+            logWrite("BLE connect FAIL");
+            NimBLEDevice::deleteClient(pClient);
+            pClient = nullptr;
+            lv_label_set_text(lblCamera, "Cam: FAIL (2x tap)");
+            continue;
+        }
+
+        auto svc = pClient->getService("0000fff0-0000-1000-8000-00805f9b34fb");
+        if (!svc) {
+            logWrite("BLE SVC not found");
+            pClient->disconnect();
+            NimBLEDevice::deleteClient(pClient);
+            pClient = nullptr;
+            lv_label_set_text(lblCamera, "Cam: SVC ERR");
+            continue;
+        }
+
+        pWriteChr = svc->getCharacteristic("0000fff3-0000-1000-8000-00805f9b34fb");
+        if (!pWriteChr) {
+            logWrite("BLE CHR not found");
+            pClient->disconnect();
+            NimBLEDevice::deleteClient(pClient);
+            pClient = nullptr;
+            lv_label_set_text(lblCamera, "Cam: CHR ERR");
+            continue;
+        }
+
+        auto nc = svc->getCharacteristic("0000fff4-0000-1000-8000-00805f9b34fb");
+        if (nc && nc->canNotify()) {
+            nc->subscribe(true, [](NimBLERemoteCharacteristic* c,
+                                    uint8_t* data, size_t len, bool isNotify){});
+        }
+
+        connected = true;
+        logWrite("BLE connected to camera");
+
+        // GPS инъекция пока подключены
+        while (connected) {
+            vTaskDelay(1000/portTICK_PERIOD_MS);
+            sendGpsData();
+        }
+
+        // Отвалились
+        logWrite("BLE lost. Double tap to reconnect.");
+        pWriteChr = nullptr;
+        NimBLEDevice::deleteClient(pClient);
+        pClient = nullptr;
     }
-    connected=true;
-    while(connected){vTaskDelay(3000/portTICK_PERIOD_MS);}
+
     vTaskDelete(NULL);
 }
 
@@ -327,9 +448,11 @@ void setup(){
     instance.begin();
     beginLvglHelper(instance);
     instance.setBrightness(200);
-    gpsSerial.begin(9600,SERIAL_8N1,43,44);
+    startMs=millis();
+
     sdReady=SD.exists("/");
-    Serial.printf("[SD] %s\n",sdReady?"Ready":"Not found");
+    logWrite("=== TWatch-DJI START ===");
+    logWritef("SD: %s",sdReady?"OK":"NOT FOUND");
 
     lv_obj_set_style_bg_color(lv_scr_act(),lv_color_black(),0);
     lv_obj_set_style_bg_opa(lv_scr_act(),LV_OPA_COVER,0);
@@ -338,7 +461,7 @@ void setup(){
     lv_label_set_text(lblTime,"--:--");
     lv_obj_set_style_text_color(lblTime,lv_color_white(),0);
     lv_obj_set_style_text_font(lblTime,&lv_font_montserrat_32,0);
-    lv_obj_align(lblTime,LV_ALIGN_TOP_LEFT,30,20);
+    lv_obj_align(lblTime,LV_ALIGN_TOP_LEFT,50,20);
 
     lblRec=lv_label_create(lv_scr_act());
     lv_label_set_text(lblRec,"●");
@@ -389,7 +512,7 @@ void setup(){
     lv_obj_align(lblBat,LV_ALIGN_TOP_MID,0,305);
 
     lblCamera=lv_label_create(lv_scr_act());
-    lv_label_set_text(lblCamera,"Cam: connecting...");
+    lv_label_set_text(lblCamera,"Cam: -- (2x tap)");
     lv_obj_set_style_text_color(lblCamera,lv_palette_darken(LV_PALETTE_GREY,1),0);
     lv_obj_set_style_text_font(lblCamera,&lv_font_montserrat_18,0);
     lv_obj_set_style_text_align(lblCamera,LV_TEXT_ALIGN_CENTER,0);
@@ -400,30 +523,43 @@ void setup(){
 }
 
 void loop(){
-    while(gpsSerial.available()) gps.encode(gpsSerial.read());
+    instance.gps.loop();
     instance.loop();
+
+    if(!firstFix&&instance.gps.location.isValid()){
+        firstFix=true;
+        uint32_t fixTime=(millis()-startMs)/1000;
+        logWritef("GPS first fix: %.5f, %.5f, %d sats, time=%lus",
+            instance.gps.location.lat(),instance.gps.location.lng(),
+            (int)instance.gps.satellites.value(),fixTime);
+        gpxCheckDay();
+    }
 
     if(millis()-lastUiUpdate>2000){
         lastUiUpdate=millis();
         updateUI();
     }
-    if(connected&&millis()-lastGpsPush>1000){
-        lastGpsPush=millis();
-        sendGpsData();
-    }
+
     if(millis()-lastTrackMs>TRACK_INTERVAL_MS){
         lastTrackMs=millis();
         gpxCheckDay();
         gpxWriteTrackPoint();
     }
+
+    if(millis()-lastBatLogMs>BAT_LOG_INTERVAL_MS){
+        lastBatLogMs=millis();
+        logWritef("Battery: %d%%",instance.pmu.getBatteryPercent());
+    }
+
     if(instance.getTouched()){
-        if(millis()-lastTouchMs>500){
+        if(millis()-lastTouchMs>200){
             lastTouchMs=millis();
             int16_t x,y;
             instance.getPoint(&x,&y);
-            toggleRecording();
+            handleTouch();
         }
     }
+
     lv_task_handler();
     delay(5);
 }
