@@ -3,6 +3,7 @@
 #include <NimBLEDevice.h>
 #include <SD.h>
 #include <FS.h>
+#include <bosch/BoschSensorDataHelper.hpp>
 
 static const char* CAMERA_MAC   = "04:a8:5a:8c:bc:6c";
 static const uint32_t DEVICE_ID = 0x00000015;
@@ -15,6 +16,7 @@ static const uint32_t DEVICE_ID = 0x00000015;
 static char  gpxPath[32] = "";
 static int   lastGpxDay  = -1;
 static bool  sdReady     = false;
+static bool  gpxLogging  = false;
 static uint32_t lastTrackMs = 0;
 #define TRACK_INTERVAL_MS 60000UL
 
@@ -25,23 +27,40 @@ static bool firstFix    = false;
 static uint32_t lastBatLogMs = 0;
 #define BAT_LOG_INTERVAL_MS 1800000UL
 
+#define DISPLAY_TIMEOUT_MS 60000UL
+static uint32_t lastActivityMs = 0;
+static bool displayOn = true;
+static float prevAccelMag = 0.0f;
+static uint32_t sleepStartMs = 0;
+
+SensorXYZ accel(SensorBHI260AP::ACCEL_PASSTHROUGH, instance.sensor);
+
+#define ZONE_SPLIT 335
 static lv_obj_t* lblTime   = nullptr;
 static lv_obj_t* lblRec    = nullptr;
 static lv_obj_t* lblCoords = nullptr;
 static lv_obj_t* lblSpeed  = nullptr;
-static lv_obj_t* lblBat    = nullptr;
-static lv_obj_t* lblCamera = nullptr;
+static lv_obj_t* lblCamSat = nullptr;
+static lv_obj_t* lblLog    = nullptr;
+static lv_obj_t* lblBatSd  = nullptr;
 
 static NimBLEClient*               pClient   = nullptr;
 static NimBLERemoteCharacteristic* pWriteChr = nullptr;
 static bool    connected     = false;
 static bool    isRecording   = false;
 static uint16_t seqNum       = 0;
-static bool    triggerConnect = false;  // двойной тап
+static bool    triggerConnect = false;
 
 static uint32_t lastUiUpdate = 0;
-static uint32_t lastTouchMs  = 0;
 
+static uint32_t touchStartMs = 0;
+static bool touchActive = false;
+static int16_t touchX = 0, touchY = 0;
+static uint32_t lastTouchMs = 0;
+
+// ═══════════════════════════════════════════════════════════
+// CRC16 / CRC32
+// ═══════════════════════════════════════════════════════════
 static const uint16_t crc16_table[256] = {
     0x0000,0xc0c1,0xc181,0x0140,0xc301,0x03c0,0x0280,0xc241,
     0xc601,0x06c0,0x0780,0xc741,0x0500,0xc5c1,0xc481,0x0440,
@@ -120,7 +139,6 @@ uint32_t dji_crc32(const uint8_t* d, size_t l) {
     while(l--){uint8_t i=(crc^*d++)&0xFF;crc=(crc32_table[i]^(crc>>8))&0xFFFFFFFF;}
     return crc;
 }
-
 size_t dji_build_frame(uint8_t* buf, uint8_t cmd_set, uint8_t cmd_id,
                        const uint8_t* data, size_t data_len, uint16_t seq) {
     size_t total=14+data_len+4, off=0;
@@ -138,6 +156,21 @@ size_t dji_build_frame(uint8_t* buf, uint8_t cmd_set, uint8_t cmd_id,
     return off;
 }
 
+// ═══════════════════════════════════════════════════════════
+// Дисплей — только яркость, без sleepDisplay()
+// ═══════════════════════════════════════════════════════════
+void wakeDisplay() {
+    if (!displayOn) {
+        displayOn = true;
+        instance.setBrightness(200);
+    }
+    lastActivityMs = millis();
+    Serial.printf("[WAKE] lastActivity reset, displayOn=%d\n", displayOn);
+}
+
+// ═══════════════════════════════════════════════════════════
+// LOG
+// ═══════════════════════════════════════════════════════════
 void logWrite(const char* msg) {
     Serial.println(msg);
     if(!sdReady) return;
@@ -156,15 +189,15 @@ void logWrite(const char* msg) {
     else f.printf("[%08lu] %s\n",millis(),msg);
     f.close();
 }
-
 void logWritef(const char* fmt,...) {
-    char buf[128];
-    va_list args; va_start(args,fmt);
-    vsnprintf(buf,sizeof(buf),fmt,args);
-    va_end(args);
+    char buf[128]; va_list a; va_start(a,fmt);
+    vsnprintf(buf,sizeof(buf),fmt,a); va_end(a);
     logWrite(buf);
 }
 
+// ═══════════════════════════════════════════════════════════
+// BLE команды
+// ═══════════════════════════════════════════════════════════
 void sendRecordCommand(bool start) {
     if(!pWriteChr||!connected) return;
     uint8_t payload[9];
@@ -192,6 +225,7 @@ void sendGpsData() {
     int32_t alt=instance.gps.altitude.isValid()?(int32_t)(instance.gps.altitude.meters()*1000.0f):0;
     memcpy(p,&alt,4); p+=4;
     float spd=instance.gps.speed.isValid()?(float)instance.gps.speed.mps():0.0f;
+    if(spd<0.5f) spd=0.0f;
     float crs=instance.gps.course.isValid()?(float)(instance.gps.course.deg()*3.14159265f/180.0f):0.0f;
     float sn=spd*cosf(crs)*100.0f,se=spd*sinf(crs)*100.0f,sd=0.0f;
     memcpy(p,&sn,4); p+=4; memcpy(p,&se,4); p+=4; memcpy(p,&sd,4); p+=4;
@@ -204,6 +238,9 @@ void sendGpsData() {
     if(!ok) logWrite("GPS inject FAIL");
 }
 
+// ═══════════════════════════════════════════════════════════
+// GPX
+// ═══════════════════════════════════════════════════════════
 void gpxCreateFile(const char* path) {
     File f=SD.open(path,FILE_WRITE);
     if(!f){logWritef("GPX create FAIL: %s",path);return;}
@@ -214,7 +251,6 @@ void gpxCreateFile(const char* path) {
     f.print(TRKSEG_CLOSE); f.print(GPX_CLOSE); f.close();
     logWritef("GPX created: %s",path);
 }
-
 void gpxCheckDay() {
     if(!sdReady||!instance.gps.date.isValid()) return;
     if(instance.gps.date.day()==lastGpxDay) return;
@@ -224,11 +260,10 @@ void gpxCheckDay() {
     if(!SD.exists(gpxPath)) gpxCreateFile(gpxPath);
     else logWritef("GPX using: %s",gpxPath);
 }
-
 void gpxWriteTrackPoint() {
     if(!sdReady||gpxPath[0]=='\0'||!instance.gps.location.isValid()) return;
     File f=SD.open(gpxPath,FILE_WRITE);
-    if(!f){logWrite("GPX trkpt FAIL");return;}
+    if(!f) return;
     uint32_t size=f.size();
     if(size<FULL_CLOSE_LEN){f.close();return;}
     f.seek(size-FULL_CLOSE_LEN);
@@ -244,11 +279,10 @@ void gpxWriteTrackPoint() {
     f.printf("      </trkpt>\n");
     f.print(TRKSEG_CLOSE); f.print(GPX_CLOSE); f.close();
 }
-
 void gpxWriteWaypoint(const char* name) {
     if(!sdReady||gpxPath[0]=='\0'||!instance.gps.location.isValid()) return;
     File f=SD.open(gpxPath,FILE_WRITE);
-    if(!f){logWritef("GPX wpt FAIL: %s",name);return;}
+    if(!f) return;
     uint32_t size=f.size();
     if(size<GPX_CLOSE_LEN){f.close();return;}
     f.seek(size-GPX_CLOSE_LEN);
@@ -265,10 +299,11 @@ void gpxWriteWaypoint(const char* name) {
     logWritef("GPX wpt: %s",name);
 }
 
+// ═══════════════════════════════════════════════════════════
+// Управление записью и логгером
+// ═══════════════════════════════════════════════════════════
 void toggleRecording() {
-    // Вибрация всегда
-    instance.setHapticEffects(14);
-    instance.vibrator();
+    instance.setHapticEffects(14); instance.vibrator();
     if(!connected||!pWriteChr) return;
     isRecording=!isRecording;
     sendRecordCommand(isRecording);
@@ -283,40 +318,61 @@ void toggleRecording() {
     }
 }
 
-// ═══════════════════════════════════════════════════════════
-// Обработка тапов: одиночный = запись, двойной = коннект
-// ═══════════════════════════════════════════════════════════
-void handleTouch() {
-    static uint32_t lastTapMs = 0;
-    static int tapCount = 0;
-    uint32_t now = millis();
-
-    if (now - lastTapMs < 400) {
-        tapCount++;
+void toggleLogger() {
+    instance.setHapticEffects(14); instance.vibrator();
+    gpxLogging=!gpxLogging;
+    if(gpxLogging){
+        gpxCheckDay();
+        lv_label_set_text(lblLog,"▶ LOG: ON");
+        lv_obj_set_style_text_color(lblLog,lv_palette_main(LV_PALETTE_GREEN),0);
+        logWrite("Logger START");
     } else {
-        tapCount = 1;
-    }
-    lastTapMs = now;
-
-    if (tapCount >= 2) {
-        tapCount = 0;
-        if (!connected) {
-            // Двойной тап — подключиться к камере
-            triggerConnect = true;
-            instance.setHapticEffects(7);
-            instance.vibrator();
-            delay(100);
-            instance.setHapticEffects(7);
-            instance.vibrator();
-            lv_label_set_text(lblCamera, "Cam: connecting...");
-            logWrite("Double tap: connecting...");
-        }
-    } else {
-        // Одиночный тап — запись
-        toggleRecording();
+        lv_label_set_text(lblLog,"■ LOG: OFF");
+        lv_obj_set_style_text_color(lblLog,lv_palette_darken(LV_PALETTE_GREY,2),0);
+        logWrite("Logger STOP");
     }
 }
 
+// ═══════════════════════════════════════════════════════════
+// Обработка тапов
+// ═══════════════════════════════════════════════════════════
+void handleTouchEnd(int16_t x, int16_t y, uint32_t duration) {
+    if(millis()-lastTouchMs<250) return;
+    lastTouchMs=millis();
+
+    if(y < ZONE_SPLIT) {
+        if(duration < 600) {
+            static uint32_t lastTopTapMs = 0;
+            static int topTapCount = 0;
+            if(millis()-lastTopTapMs < 400) topTapCount++;
+            else topTapCount = 1;
+            lastTopTapMs = millis();
+            if(topTapCount >= 2) {
+                topTapCount = 0;
+                if(!connected) {
+                    triggerConnect = true;
+                    instance.setHapticEffects(7); instance.vibrator();
+                    delay(100);
+                    instance.setHapticEffects(7); instance.vibrator();
+                    lv_label_set_text(lblCamSat,"Cam: connecting...");
+                    logWrite("Double tap: connect camera");
+                }
+            } else {
+                toggleRecording();
+            }
+        }
+    } else {
+        if(duration >= 600) {
+            toggleLogger();
+        } else {
+            instance.setHapticEffects(1); instance.vibrator();
+        }
+    }
+}
+
+// ═══════════════════════════════════════════════════════════
+// UI
+// ═══════════════════════════════════════════════════════════
 void updateUI() {
     char buf[128];
     if(instance.gps.time.isValid())
@@ -335,120 +391,91 @@ void updateUI() {
     }
     lv_label_set_text(lblCoords,buf);
 
-    if(instance.gps.location.isValid())
+    if(instance.gps.location.isValid()){
+        float kmh=instance.gps.speed.isValid()?(float)instance.gps.speed.kmph():0.0f;
+        if(kmh<2.0f) kmh=0.0f;
         snprintf(buf,sizeof(buf),"%.1f km/h   %.0f m",
-            instance.gps.speed.isValid()?(float)instance.gps.speed.kmph():0.0f,
-            instance.gps.altitude.isValid()?(float)instance.gps.altitude.meters():0.0f);
-    else snprintf(buf,sizeof(buf),"-- km/h   -- m");
+            kmh,instance.gps.altitude.isValid()?(float)instance.gps.altitude.meters():0.0f);
+    } else {
+        snprintf(buf,sizeof(buf),"-- km/h   -- m");
+    }
     lv_label_set_text(lblSpeed,buf);
 
-    snprintf(buf,sizeof(buf),"Watch: %d%%  Sat: %d  SD: %s",
-        instance.pmu.getBatteryPercent(),
-        (int)instance.gps.satellites.value(),
-        sdReady?"OK":"--");
-    lv_label_set_text(lblBat,buf);
-
+    int sats=(int)instance.gps.satellites.value();
     if(connected)
-        snprintf(buf,sizeof(buf),"Cam: OK  %s",gpxPath[0]?gpxPath+1:"no gpx");
+        snprintf(buf,sizeof(buf),"Cam: OK   Sat: %d",sats);
     else
-        snprintf(buf,sizeof(buf),"Cam: -- (2x tap)");
-    lv_label_set_text(lblCamera,buf);
+        snprintf(buf,sizeof(buf),"Cam: --   Sat: %d",sats);
+    lv_label_set_text(lblCamSat,buf);
+
+    snprintf(buf,sizeof(buf),"Bat: %d%%    SD: %s",
+        instance.pmu.getBatteryPercent(), sdReady?"OK":"--");
+    lv_label_set_text(lblBatSd,buf);
 }
 
+// ═══════════════════════════════════════════════════════════
+// BLE
+// ═══════════════════════════════════════════════════════════
 class CameraCallbacks : public NimBLEClientCallbacks {
     void onDisconnect(NimBLEClient* c, int reason) override {
         connected=false; isRecording=false; pWriteChr=nullptr;
         lv_label_set_text(lblRec,"●");
         lv_obj_set_style_text_color(lblRec,lv_palette_darken(LV_PALETTE_GREY,2),0);
-        lv_label_set_text(lblCamera,"Cam: -- (2x tap)");
-        logWritef("BLE disconnected, reason=%d",reason);
+        logWritef("BLE disconnected %d",reason);
     }
 };
 
-// ═══════════════════════════════════════════════════════════
-// BLE Task — ждёт двойного тапа, подключается, GPS инъекция
-// ═══════════════════════════════════════════════════════════
 void bleTask(void* pvParameters) {
     vTaskDelay(2000/portTICK_PERIOD_MS);
     NimBLEDevice::init("TWatch-DJI");
     NimBLEDevice::setPower(3);
     NimBLEDevice::setMTU(512);
-    NimBLEAddress addr(std::string(CAMERA_MAC), BLE_ADDR_PUBLIC);
-
-    while (true) {
-        // Ждём двойного тапа
-        logWrite("Waiting double tap to connect...");
-        while (!triggerConnect) {
-            vTaskDelay(200/portTICK_PERIOD_MS);
-        }
-        triggerConnect = false;
-
-        // Попытка подключения
-        pClient = NimBLEDevice::createClient();
-        pClient->setClientCallbacks(new CameraCallbacks(), false);
+    NimBLEAddress addr(std::string(CAMERA_MAC),BLE_ADDR_PUBLIC);
+    while(true){
+        while(!triggerConnect) vTaskDelay(200/portTICK_PERIOD_MS);
+        triggerConnect=false;
+        pClient=NimBLEDevice::createClient();
+        pClient->setClientCallbacks(new CameraCallbacks(),false);
         pClient->setConnectTimeout(10000);
-
         logWrite("BLE connecting...");
-
-        if (!pClient->connect(addr)) {
-            logWrite("BLE connect FAIL");
-            NimBLEDevice::deleteClient(pClient);
-            pClient = nullptr;
-            lv_label_set_text(lblCamera, "Cam: FAIL (2x tap)");
+        if(!pClient->connect(addr)){
+            logWrite("BLE FAIL");
+            NimBLEDevice::deleteClient(pClient); pClient=nullptr;
+            lv_label_set_text(lblCamSat,"Cam: FAIL (2x tap)");
             continue;
         }
-
-        auto svc = pClient->getService("0000fff0-0000-1000-8000-00805f9b34fb");
-        if (!svc) {
-            logWrite("BLE SVC not found");
-            pClient->disconnect();
-            NimBLEDevice::deleteClient(pClient);
-            pClient = nullptr;
-            lv_label_set_text(lblCamera, "Cam: SVC ERR");
-            continue;
-        }
-
-        pWriteChr = svc->getCharacteristic("0000fff3-0000-1000-8000-00805f9b34fb");
-        if (!pWriteChr) {
-            logWrite("BLE CHR not found");
-            pClient->disconnect();
-            NimBLEDevice::deleteClient(pClient);
-            pClient = nullptr;
-            lv_label_set_text(lblCamera, "Cam: CHR ERR");
-            continue;
-        }
-
-        auto nc = svc->getCharacteristic("0000fff4-0000-1000-8000-00805f9b34fb");
-        if (nc && nc->canNotify()) {
-            nc->subscribe(true, [](NimBLERemoteCharacteristic* c,
-                                    uint8_t* data, size_t len, bool isNotify){});
-        }
-
-        connected = true;
-        logWrite("BLE connected to camera");
-
-        // GPS инъекция пока подключены
-        while (connected) {
-            vTaskDelay(1000/portTICK_PERIOD_MS);
-            sendGpsData();
-        }
-
-        // Отвалились
-        logWrite("BLE lost. Double tap to reconnect.");
-        pWriteChr = nullptr;
-        NimBLEDevice::deleteClient(pClient);
-        pClient = nullptr;
+        auto svc=pClient->getService("0000fff0-0000-1000-8000-00805f9b34fb");
+        if(!svc){pClient->disconnect();NimBLEDevice::deleteClient(pClient);pClient=nullptr;continue;}
+        pWriteChr=svc->getCharacteristic("0000fff3-0000-1000-8000-00805f9b34fb");
+        if(!pWriteChr){pClient->disconnect();NimBLEDevice::deleteClient(pClient);pClient=nullptr;continue;}
+        auto nc=svc->getCharacteristic("0000fff4-0000-1000-8000-00805f9b34fb");
+        if(nc&&nc->canNotify())
+            nc->subscribe(true,[](NimBLERemoteCharacteristic*,uint8_t*,size_t,bool){});
+        connected=true;
+        logWrite("BLE connected!");
+        while(connected){vTaskDelay(1000/portTICK_PERIOD_MS);sendGpsData();}
+        logWrite("BLE lost.");
+        pWriteChr=nullptr;
+        NimBLEDevice::deleteClient(pClient); pClient=nullptr;
     }
-
     vTaskDelete(NULL);
 }
 
+// ═══════════════════════════════════════════════════════════
+// Setup
+// ═══════════════════════════════════════════════════════════
 void setup(){
     Serial.begin(115200);
     instance.begin();
     beginLvglHelper(instance);
     instance.setBrightness(200);
     startMs=millis();
+    lastActivityMs=millis();
+
+    if(instance.getDeviceProbe() & HW_BHI260AP_ONLINE){
+        accel.enable(25.0f, 0);
+        Serial.println("[IMU] Accel enabled");
+    }
 
     sdReady=SD.exists("/");
     logWrite("=== TWatch-DJI START ===");
@@ -460,103 +487,149 @@ void setup(){
     lblTime=lv_label_create(lv_scr_act());
     lv_label_set_text(lblTime,"--:--");
     lv_obj_set_style_text_color(lblTime,lv_color_white(),0);
-    lv_obj_set_style_text_font(lblTime,&lv_font_montserrat_32,0);
-    lv_obj_align(lblTime,LV_ALIGN_TOP_LEFT,50,20);
+    lv_obj_set_style_text_font(lblTime,&lv_font_montserrat_28,0);
+    lv_obj_align(lblTime,LV_ALIGN_TOP_LEFT,70,15);
 
     lblRec=lv_label_create(lv_scr_act());
     lv_label_set_text(lblRec,"●");
     lv_obj_set_style_text_color(lblRec,lv_palette_darken(LV_PALETTE_GREY,2),0);
-    lv_obj_set_style_text_font(lblRec,&lv_font_montserrat_32,0);
-    lv_obj_align(lblRec,LV_ALIGN_TOP_RIGHT,-60,20);
+    lv_obj_set_style_text_font(lblRec,&lv_font_montserrat_28,0);
+    lv_obj_align(lblRec,LV_ALIGN_TOP_RIGHT,-90,15);
 
     lv_obj_t* l1=lv_label_create(lv_scr_act());
     lv_label_set_text(l1,"────────────────");
-    lv_obj_set_style_text_color(l1,lv_palette_darken(LV_PALETTE_GREY,2),0);
+    lv_obj_set_style_text_color(l1,lv_palette_darken(LV_PALETTE_GREY,3),0);
     lv_obj_set_style_text_font(l1,&lv_font_montserrat_14,0);
-    lv_obj_align(l1,LV_ALIGN_TOP_MID,0,65);
+    lv_obj_align(l1,LV_ALIGN_TOP_MID,0,55);
 
     lblCoords=lv_label_create(lv_scr_act());
     lv_label_set_text(lblCoords,"GPS\nconnecting...");
     lv_obj_set_style_text_color(lblCoords,lv_palette_main(LV_PALETTE_YELLOW),0);
-    lv_obj_set_style_text_font(lblCoords,&lv_font_montserrat_32,0);
+    lv_obj_set_style_text_font(lblCoords,&lv_font_montserrat_30,0);
     lv_obj_set_style_text_align(lblCoords,LV_TEXT_ALIGN_CENTER,0);
     lv_obj_set_width(lblCoords,390);
-    lv_obj_align(lblCoords,LV_ALIGN_TOP_MID,0,85);
+    lv_obj_align(lblCoords,LV_ALIGN_TOP_MID,0,75);
 
     lv_obj_t* l2=lv_label_create(lv_scr_act());
     lv_label_set_text(l2,"────────────────");
-    lv_obj_set_style_text_color(l2,lv_palette_darken(LV_PALETTE_GREY,2),0);
+    lv_obj_set_style_text_color(l2,lv_palette_darken(LV_PALETTE_GREY,3),0);
     lv_obj_set_style_text_font(l2,&lv_font_montserrat_14,0);
-    lv_obj_align(l2,LV_ALIGN_TOP_MID,0,220);
+    lv_obj_align(l2,LV_ALIGN_TOP_MID,0,200);
 
     lblSpeed=lv_label_create(lv_scr_act());
     lv_label_set_text(lblSpeed,"-- km/h   -- m");
     lv_obj_set_style_text_color(lblSpeed,lv_palette_main(LV_PALETTE_CYAN),0);
-    lv_obj_set_style_text_font(lblSpeed,&lv_font_montserrat_28,0);
+    lv_obj_set_style_text_font(lblSpeed,&lv_font_montserrat_26,0);
     lv_obj_set_style_text_align(lblSpeed,LV_TEXT_ALIGN_CENTER,0);
     lv_obj_set_width(lblSpeed,390);
-    lv_obj_align(lblSpeed,LV_ALIGN_TOP_MID,0,240);
+    lv_obj_align(lblSpeed,LV_ALIGN_TOP_MID,0,220);
 
-    lv_obj_t* l3=lv_label_create(lv_scr_act());
-    lv_label_set_text(l3,"────────────────");
-    lv_obj_set_style_text_color(l3,lv_palette_darken(LV_PALETTE_GREY,2),0);
-    lv_obj_set_style_text_font(l3,&lv_font_montserrat_14,0);
-    lv_obj_align(l3,LV_ALIGN_TOP_MID,0,285);
+    lblCamSat=lv_label_create(lv_scr_act());
+    lv_label_set_text(lblCamSat,"Cam: --   Sat: -");
+    lv_obj_set_style_text_color(lblCamSat,lv_palette_darken(LV_PALETTE_GREY,1),0);
+    lv_obj_set_style_text_font(lblCamSat,&lv_font_montserrat_20,0);
+    lv_obj_set_style_text_align(lblCamSat,LV_TEXT_ALIGN_CENTER,0);
+    lv_obj_set_width(lblCamSat,390);
+    lv_obj_align(lblCamSat,LV_ALIGN_TOP_MID,0,270);
 
-    lblBat=lv_label_create(lv_scr_act());
-    lv_label_set_text(lblBat,"Watch: --%  Sat: -  SD: --");
-    lv_obj_set_style_text_color(lblBat,lv_color_white(),0);
-    lv_obj_set_style_text_font(lblBat,&lv_font_montserrat_18,0);
-    lv_obj_set_style_text_align(lblBat,LV_TEXT_ALIGN_CENTER,0);
-    lv_obj_set_width(lblBat,390);
-    lv_obj_align(lblBat,LV_ALIGN_TOP_MID,0,305);
+    lv_obj_t* zoneLine=lv_obj_create(lv_scr_act());
+    lv_obj_set_size(zoneLine,410,3);
+    lv_obj_set_style_bg_color(zoneLine,lv_palette_main(LV_PALETTE_BLUE_GREY),0);
+    lv_obj_set_style_bg_opa(zoneLine,LV_OPA_COVER,0);
+    lv_obj_set_style_border_width(zoneLine,0,0);
+    lv_obj_set_style_pad_all(zoneLine,0,0);
+    lv_obj_set_style_radius(zoneLine,0,0);
+    lv_obj_align(zoneLine,LV_ALIGN_TOP_MID,0,318);
 
-    lblCamera=lv_label_create(lv_scr_act());
-    lv_label_set_text(lblCamera,"Cam: -- (2x tap)");
-    lv_obj_set_style_text_color(lblCamera,lv_palette_darken(LV_PALETTE_GREY,1),0);
-    lv_obj_set_style_text_font(lblCamera,&lv_font_montserrat_18,0);
-    lv_obj_set_style_text_align(lblCamera,LV_TEXT_ALIGN_CENTER,0);
-    lv_obj_set_width(lblCamera,390);
-    lv_obj_align(lblCamera,LV_ALIGN_TOP_MID,0,335);
+    lblLog=lv_label_create(lv_scr_act());
+    lv_label_set_text(lblLog,"■ LOG: OFF");
+    lv_obj_set_style_text_color(lblLog,lv_palette_darken(LV_PALETTE_GREY,2),0);
+    lv_obj_set_style_text_font(lblLog,&lv_font_montserrat_28,0);
+    lv_obj_set_style_text_align(lblLog,LV_TEXT_ALIGN_CENTER,0);
+    lv_obj_set_width(lblLog,390);
+    lv_obj_align(lblLog,LV_ALIGN_TOP_MID,0,345);
+
+    lblBatSd=lv_label_create(lv_scr_act());
+    lv_label_set_text(lblBatSd,"Bat: --%    SD: --");
+    lv_obj_set_style_text_color(lblBatSd,lv_palette_darken(LV_PALETTE_GREY,1),0);
+    lv_obj_set_style_text_font(lblBatSd,&lv_font_montserrat_20,0);
+    lv_obj_set_style_text_align(lblBatSd,LV_TEXT_ALIGN_CENTER,0);
+    lv_obj_set_width(lblBatSd,390);
+    lv_obj_align(lblBatSd,LV_ALIGN_TOP_MID,0,425);
 
     xTaskCreate(bleTask,"ble",8192,NULL,1,NULL);
 }
 
+// ═══════════════════════════════════════════════════════════
+// Loop
+// ═══════════════════════════════════════════════════════════
 void loop(){
     instance.gps.loop();
     instance.loop();
 
+// Гасить дисплей
+if(displayOn && millis()-lastActivityMs>DISPLAY_TIMEOUT_MS){
+    displayOn=false;
+    sleepStartMs=millis();
+    instance.setBrightness(0);
+    Serial.println("[SLEEP]");
+}
+
+// Пробуждение по встряхиванию — только после 2 сек сна
+// Детектируем ИЗМЕНЕНИЕ ускорения, не абсолютное значение
+if(!displayOn && millis()-sleepStartMs>2000 && accel.hasUpdated()){
+    float x=accel.getX(), y=accel.getY(), z=accel.getZ();
+    float mag=sqrtf(x*x+y*y+z*z);
+    float delta=fabsf(mag-prevAccelMag);
+    prevAccelMag=mag;
+    Serial.printf("[ACCEL] mag=%.1f delta=%.1f\n", mag, delta);
+    if(delta>3.0f){
+        wakeDisplay();
+    }
+}
+
+    // Первый GPS фикс
     if(!firstFix&&instance.gps.location.isValid()){
         firstFix=true;
-        uint32_t fixTime=(millis()-startMs)/1000;
-        logWritef("GPS first fix: %.5f, %.5f, %d sats, time=%lus",
+        uint32_t t=(millis()-startMs)/1000;
+        logWritef("GPS fix: %.5f,%.5f %dsats %lus",
             instance.gps.location.lat(),instance.gps.location.lng(),
-            (int)instance.gps.satellites.value(),fixTime);
+            (int)instance.gps.satellites.value(),t);
         gpxCheckDay();
     }
 
+    // UI каждые 2 сек
     if(millis()-lastUiUpdate>2000){
         lastUiUpdate=millis();
         updateUI();
     }
 
-    if(millis()-lastTrackMs>TRACK_INTERVAL_MS){
+    // GPX трекпоинт
+    if(gpxLogging&&millis()-lastTrackMs>TRACK_INTERVAL_MS){
         lastTrackMs=millis();
         gpxCheckDay();
         gpxWriteTrackPoint();
     }
 
+    // Батарея каждые 30 мин
     if(millis()-lastBatLogMs>BAT_LOG_INTERVAL_MS){
         lastBatLogMs=millis();
         logWritef("Battery: %d%%",instance.pmu.getBatteryPercent());
     }
 
-    if(instance.getTouched()){
-        if(millis()-lastTouchMs>200){
-            lastTouchMs=millis();
-            int16_t x,y;
-            instance.getPoint(&x,&y);
-            handleTouch();
+    // Обработка касания
+    bool isTouched=instance.getTouched();
+    if(isTouched&&!touchActive){
+        touchActive=true;
+        touchStartMs=millis();
+        instance.getPoint(&touchX,&touchY);
+    }
+    if(!isTouched&&touchActive){
+        touchActive=false;
+        uint32_t dur=millis()-touchStartMs;
+        wakeDisplay();  // будим только при завершении тапа
+        if(displayOn){
+            handleTouchEnd(touchX,touchY,dur);
         }
     }
 
