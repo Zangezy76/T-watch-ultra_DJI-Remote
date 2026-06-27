@@ -3,7 +3,7 @@
 All notable changes to this project are documented in this file.
 
 The current focus of this repository is the **T-Watch Ultra Arduino port**
-(`arduino/step6_gps_injection/`). Earlier `v1.x` entries describe the original
+(`arduino/DJI_TWatch_Remote/`). Earlier `v1.x` entries describe the original
 ESP-IDF firmware for M5Stack / Waveshare boards that this project was forked
 from; that firmware still lives in the repo (`protocol/`, `ble/`, `logic/`,
 `main/`, `sdkconfig.defaults.*`) and serves as the protocol reference.
@@ -39,4 +39,4 @@ the watch application itself is new.
 
 - **GPX truncation** — `FILE_WRITE` (`"w"`) truncates on esp32 core 3.x;
   switched to seek-based append with `"r+"` so headers and prior points survive.
-- 
+- **
