@@ -1,46 +1,41 @@
 # Release Notes
 
-## DJI-Remote v1.2.0
+## DJI-Remote v2.0.0 — T-Watch Ultra Arduino port
 
-This release adds the Waveshare ESP32-S3-LCD-1.9 as a second supported hardware
-target and switches to a web-flash-only release model.
+A custom BLE remote for the **DJI Osmo Action 5 Pro**, running on the
+**LILYGO T-Watch Ultra** (ESP32-S3R8) as an Arduino sketch built on LilyGoLib.
+It controls recording from the wrist, injects real-time GPS for overlay in
+DJI Mimo, and logs GPX tracks to SD card.
 
-### What's New in v1.2.0
+### What's New in v2.0.0
 
-- **Waveshare ESP32-S3-LCD-1.9 support** — New HAL, ESP32-S3 target,
-  320x170 landscape IPS display (ST7789V2).
-- **Dual-target release builds** — Two merged binaries produced per release,
-  one per hardware target.
-- **Web-flash only** — Manual flash ZIP and scripts removed from release
-  artifacts and documentation.
-- **UI layout for 320x170** — Adaptive layout system supporting both
-  320x240 (M5Stack) and 320x170 (Waveshare) screen resolutions.
-- **GPS Kconfig** — GPS UART pins and baud rate configurable per board
-  via Kconfig (no hardcoded pin assignments).
+- **BLE camera control** — Start/stop recording from the wrist.
+- **Real-time GPS injection** — Coordinates sent to the camera every second;
+  GPS overlay confirmed working in DJI Mimo.
+- **GPX track logger** — Track points and waypoints (REC markers, manual "BITE"
+  markers) saved to SD card, one file per day.
+- **Two-zone touch UI** — Upper 2/3 controls the camera, lower 1/3 the logger.
+- **Display auto-sleep + shake-to-wake** — Sleeps after 1 minute, wakes on a
+  wrist shake (BHI260AP IMU).
 
-### Flash Instructions
+### Hardware
 
-Flash via [espflash.app](https://espflash.app) (Chrome or Edge required).
-Download the binary for your hardware target from the
-[latest release](https://github.com/rhoenschrat/DJI-Remote/releases/latest):
+| Component | Details |
+|-----------|---------|
+| Watch | LILYGO T-Watch Ultra (ESP32-S3R8, BLE 5.0) |
+| Display | 2.01" AMOLED 410×502 (CO5300) |
+| GPS | u-blox MIA-M10Q (built-in) |
+| IMU | BHI260AP (shake-to-wake) |
+| Camera | DJI Osmo Action 5 Pro |
 
-- `dji-remote-v1.2.0-m5stack-basic-v27.bin` — M5Stack Basic V2.7
-- `dji-remote-v1.2.0-waveshare-s3-lcd19.bin` — Waveshare ESP32-S3-LCD-1.9
+### Flash Instructions (Arduino IDE)
 
-### Flash Settings — M5Stack Basic V2.7
+This release ships as an Arduino sketch, not a pre-built web-flash binary.
 
-| Setting         | Value  |
-|-----------------|--------|
-| Chip            | ESP32  |
-| Flash mode      | DIO    |
-| Flash size      | 16 MB  |
-| Flash frequency | 80 MHz |
-
-### Flash Settings — Waveshare ESP32-S3-LCD-1.9
-
-| Setting         | Value    |
-|-----------------|----------|
-| Chip            | ESP32-S3 |
-| Flash mode      | DIO      |
-| Flash size      | 16 MB    |
-| Flash frequency | 80 MHz   |
+1. Install **Arduino IDE 2.x** and the **esp32 by Espressif Systems** core
+   **3.3.8** via Boards Manager.
+2. Install the libraries at the **exact** versions listed in
+   [`WORKING_LIBRARIES.md`](WORKING_LIBRARIES.md) — do **not** let Arduino IDE
+   auto-update them (LilyGoLib 0.1.0, SensorLib 0.3.3, RadioLib 7.4.0,
+   LVGL 9.4.0, NimBLE-Arduino 2.5.0, TinyGPSPlus).
+3. Open `arduino/step6_gps_in
