@@ -58,7 +58,7 @@ A custom BLE remote control for DJI Osmo Action 5 Pro built on LILYGO T-Watch Ul
 
 ## 📡 DJI BLE Protocol
 
-Reverse-engineered from the original [DJI-Remote](https://github.com/Zangezy76/DJI-Remote) project (ESP-IDF).
+Reverse-engineered from the original [DJI-Remote](https://github.com/nicholaswilde/DJI-Remote) project (ESP-IDF).
 
 **Frame format:**
 ```
@@ -133,7 +133,7 @@ One file per day on SD card:
 2. Select board: **LILYGO T-Watch Ultra (SX1262)**
 3. Set your camera MAC address in the sketch:
 ```cpp
-static const char* CAMERA_MAC = "04:a8:5a:8c:bc:6c";
+static const char* CAMERA_MAC = "xx:xx:xx:xx:xx:xx";
 ```
 4. Upload via COM port (auto-detected, no button press needed)
 
@@ -175,4 +175,3 @@ Use case: fishing from a boat — camera mounted on the boat, watch on wrist. On
 
 ## 📄 License
 
-MIT
