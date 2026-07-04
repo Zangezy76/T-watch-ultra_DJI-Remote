@@ -113,7 +113,37 @@ https://github.com/apache/mynewt-nimble
 https://www.apache.org/licenses/LICENSE-2.0
 
 
-# 7. Summary
+# 7. Arduino Port Dependencies (T-Watch Ultra Build)
+
+The Arduino / LilyGoLib port (`arduino/DJI_TWatch_Remote/`) depends on the
+third-party libraries below. Exact working versions are pinned in
+`WORKING_LIBRARIES.md`.
+
+| Library | License | Source |
+|---------|---------|--------|
+| LilyGoLib | MIT | https://github.com/Xinyuan-LilyGO/LilyGoLib |
+| SensorLib | MIT (Bosch driver code in `src/bosch/` under BSD-3-Clause) | https://github.com/lewisxhe/SensorLib |
+| RadioLib | MIT | https://github.com/jgromes/RadioLib |
+| LVGL (v9.4.0, bundled via LilyGoLib-ThirdParty) | MIT | https://github.com/lvgl/lvgl |
+| NimBLE-Arduino | Apache-2.0 | https://github.com/h2zero/NimBLE-Arduino |
+| TinyGPSPlus | LGPL-2.1 | https://github.com/mikalhart/TinyGPSPlus |
+| Arduino-ESP32 core | LGPL-2.1 (some components Apache-2.0) | https://github.com/espressif/arduino-esp32 |
+| NFC-RFAL-fork | STMicroelectronics software license (RFAL / STSW-ST25RFAL002) | https://github.com/lewisxhe/NFC-RFAL-fork |
+| ST25R3916-fork | STMicroelectronics software license (RFAL / STSW-ST25RFAL002) | https://github.com/lewisxhe/ST25R3916-fork |
+
+The NFC libraries are compile-time dependencies of LilyGoLib and are **not** used
+by this project's functionality. They are based on STMicroelectronics' RFAL
+(STSW-ST25RFAL002) and remain subject to STMicroelectronics' software license
+terms — see the respective repositories.
+
+**License texts:**
+- MIT — https://opensource.org/licenses/MIT
+- Apache 2.0 — https://www.apache.org/licenses/LICENSE-2.0
+- LGPL 2.1 — https://www.gnu.org/licenses/old-licenses/lgpl-2.1.html
+- BSD 3-Clause — https://opensource.org/licenses/BSD-3-Clause
+
+
+# 8. Summary
 
 - The **DJI-Remote project code** is licensed under **MIT**.  
 - DJI SDK **protocol files** are under **DJI EULA** and not MIT-licensed.  
@@ -122,5 +152,6 @@ https://www.apache.org/licenses/LICENSE-2.0
 - **LVGL v9.5.0** is under **MIT**.
 - **esp_lvgl_port v2.7.2** is under **Apache 2.0**.
 - **Apache NimBLE** is under **Apache 2.0**.
+- **Arduino port libraries** — LilyGoLib, SensorLib, RadioLib, LVGL under **MIT**; NimBLE-Arduino under **Apache 2.0**; TinyGPSPlus and Arduino-ESP32 core under **LGPL 2.1**; NFC forks under **STMicroelectronics** terms.
 
 This notice ensures license clarity and proper attribution for all included third-party resources.
