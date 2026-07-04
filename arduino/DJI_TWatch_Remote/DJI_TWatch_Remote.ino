@@ -14,7 +14,7 @@
  *
  * Author: Zangezy76
  * License: MIT
- * Repository: https://github.com/Zangezy76/DJI-Remote
+ * Repository: https://github.com/Zangezy76/T-watch-ultra_DJI-Remote
  */
 
 #include <LilyGoLib.h>
@@ -507,7 +507,6 @@ const char* hdopBars() {
     if (s >= 4)  return "||...";
     if (s >= 1)  return "|....";
     return ".....";
-}
 }
 
 // ═══════════════════════════════════════════════════════════

@@ -38,4 +38,26 @@ This release ships as an Arduino sketch, not a pre-built web-flash binary.
    [`WORKING_LIBRARIES.md`](WORKING_LIBRARIES.md) — do **not** let Arduino IDE
    auto-update them (LilyGoLib 0.1.0, SensorLib 0.3.3, RadioLib 7.4.0,
    LVGL 9.4.0, NimBLE-Arduino 2.5.0, TinyGPSPlus).
-3. Open `arduino/DJI_TWatch_R
+3. Open `arduino/DJI_TWatch_Remote/DJI_TWatch_Remote.ino`.
+4. Select board: **LILYGO T-Watch Ultra (SX1262)**.
+5. Set your camera's BLE MAC in the sketch:
+   ```cpp
+   static const char* CAMERA_MAC = "xx:xx:xx:xx:xx:xx";
+   ```
+   (Find it in DJI Mimo → Camera Settings → About.)
+6. Upload via the COM port (auto-detected, no button press needed).
+
+### Field Validation
+
+- **Moscow, 06.06.2026** — 5.7 m average drift, 18.5 m max (no RTK).
+- **Kamchatka ascent, 20.06.2026** — 142 points over 2 h 21 min, 21 km,
+  +1290 m of gain (413 → 1703 m), no dropped points.
+
+---
+
+### About the ESP-IDF firmware (M5Stack / Waveshare)
+
+The original ESP-IDF firmware for M5Stack Basic V2.7 and Waveshare
+ESP32-S3-LCD-1.9 remains in this repository as the protocol reference. Its
+release history is documented in [`CHANGELOG.md`](CHANGELOG.md) under the
+`v1.x` entries.

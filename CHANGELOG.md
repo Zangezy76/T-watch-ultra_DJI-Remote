@@ -39,4 +39,81 @@ the watch application itself is new.
 
 - **GPX truncation** — `FILE_WRITE` (`"w"`) truncates on esp32 core 3.x;
   switched to seek-based append with `"r+"` so headers and prior points survive.
-- **
+- **Waypoint/trackpoint collision** — A single seek-from-end append let each new
+  trackpoint overwrite the previous waypoint; waypoints now go to a separate
+  `_wpt.gpx` file per session.
+- **Signal indicator glyphs** — `◆/◇` symbols aren't included in the Montserrat
+  LVGL build; replaced with ASCII bars (`|||||` … `.....`).
+- **HDOP parsing** — The MIA-M10Q emits `$GNGGA`, from which TinyGPSPlus does not
+  parse HDOP; the indicator falls back to satellite count.
+
+### Notes
+
+- **BLE on a FreeRTOS task** — All BLE work runs in a dedicated task; calling
+  `connect()` from `setup()` hangs the system. UI is updated via flags only.
+- **Field validation** —
+  Moscow (06.06.2026): 5.7 m average drift, 18.5 m max — no RTK.
+  Kamchatka ascent (20.06.2026): 142 points over 2 h 21 min, 21 km, +1290 m
+  (413 → 1703 m), with no dropped points.
+
+---
+
+## Inherited ESP-IDF firmware (M5Stack / Waveshare)
+
+The following releases predate the T-Watch Ultra port and describe the upstream
+ESP-IDF firmware retained in this repository.
+
+### [v1.2.0]
+
+#### Added
+
+- **Waveshare ESP32-S3-LCD-1.9 support** — New HAL, ESP32-S3 target,
+  320x170 landscape IPS display (ST7789V2).
+- **Dual-target release builds** — Two merged binaries produced per release,
+  one per hardware target.
+- **UI layout for 320x170** — Adaptive layout system supporting both
+  320x240 (M5Stack) and 320x170 (Waveshare) screen resolutions.
+- **GPS Kconfig** — GPS UART pins and baud rate configurable per board
+  via Kconfig (no hardcoded pin assignments).
+
+#### Removed
+
+- **Manual flash ZIP and scripts** — Web-flash only from this release onward.
+
+### [v1.1.0]
+
+#### Added
+
+- **LVGL 9.5.0 UI rendering** — All screens replaced with LVGL widget-based
+  rendering via esp_lvgl_port 2.7.2. Replaces manual TFT/SPI drawing.
+- **NimBLE BLE stack** — Apache NimBLE replaces Bluedroid as the GATT client
+  stack.
+- **Boot splash screen** — LVGL-rendered splash screen replaces the raw bitmap
+  boot logo.
+- **Release packaging automation** — GitHub Actions workflow and
+  `build_release.sh` produce merged binary and ZIP for every tagged release.
+
+#### Fixed
+
+- **NimBLE scan fixes** — Device names now shown during scan; duplicate filter
+  disabled; reconnect-on-unpair prevented.
+
+#### Changed
+
+- **Production log level** — Default log level set to ERROR for production
+  builds.
+
+### [v1.0.0]
+
+Initial public release. Firmware for M5Stack Basic V2.7 (ESP32).
+
+#### Features
+
+- Control up to three DJI Osmo Action cameras simultaneously over BLE
+- Live GPS forwarding to all connected cameras (10 Hz)
+- Start/stop recording, highlight tags, sleep/wake, snapshot-while-sleeping
+- Mode switching via QS button emulation
+- Automatic boot-time scanning and reconnection
+- Multi-camera action coordination with sequential wake queue
+- Optional external hardware buttons (GPIO26, GPIO21, GPIO22)
+- Supported cameras: Action 4, Action 5 Pro, Action 6, Osmo 360
