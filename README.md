@@ -178,3 +178,9 @@ Use case: fishing from a boat — camera mounted on the boat, watch on wrist. On
 This project is licensed under the [**MIT License**](https://opensource.org/licenses/MIT). See [`LICENSE`](LICENSE).
 
 Third-party licenses (DJI, ESP-IDF, MIT legacy) are listed in [`THIRD_PARTY_NOTICES.md`](THIRD_PARTY_NOTICES.md).
+
+## Support
+
+If this project helped you, consider buying me a coffee ☕
+
+**TON:** `UQC7JG7kRzsUkOZ13gul8W-CUAlob0DGQq4XBYsw9QIfaplQ`
