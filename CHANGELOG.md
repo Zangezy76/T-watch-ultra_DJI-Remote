@@ -3,7 +3,7 @@
 All notable changes to this project are documented in this file.
 
 The current focus of this repository is the **T-Watch Ultra Arduino port**
-(`arduino/DJI_TWatch_Remote/`). Earlier `v1.x` entries describe the original
+(`arduino/DJI_Remote_T-Watch/`). Earlier `v1.x` entries describe the original
 ESP-IDF firmware for M5Stack / Waveshare boards that this project was forked
 from; that firmware still lives in the repo (`protocol/`, `ble/`, `logic/`,
 `main/`, `sdkconfig.defaults.*`) and serves as the protocol reference.

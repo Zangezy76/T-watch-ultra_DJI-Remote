@@ -584,7 +584,7 @@ void bleTask(void* pvParameters) {
                 vTaskDelay(5000/portTICK_PERIOD_MS);
                 triggerConnect = true;  // auto-retry
             } else {
-                lv_label_set_text(lblCamSat,"Cam: -- (tap)");
+                lv_label_set_text(lblCamSat,"Cam: --  GPS:.....");
             }
             continue;
         }
@@ -613,6 +613,94 @@ void bleTask(void* pvParameters) {
 }
 
 // ═══════════════════════════════════════════════════════════
+// GNSS constellation: GPS + Galileo + GLONASS (BeiDou OFF)
+//
+// The u-blox MIA-M10Q tracks a MAXIMUM of 4 GNSS at once (QZSS rides on GPS and
+// does not count as a separate system). Factory default is GPS+Galileo+BeiDou
+// (+QZSS), so enabling GLONASS REQUIRES freeing a slot — we disable BeiDou to
+// make room. GPS and Galileo are left at their defaults (enabled).
+//
+// Why GLONASS instead of BeiDou here: at high / northern latitudes and in
+// terrain (e.g. Kamchatka) GLONASS gives better satellite geometry, whereas
+// BeiDou is optimised for Asia — so GLONASS yields a more stable fix for us.
+//
+// M10 uses the modern config interface UBX-CFG-VALSET (0x06 0x8A); the legacy
+// UBX-CFG-GNSS (0x06 0x3E) is NOT supported on this chip generation.
+// Config is written to RAM+BBR layers: the watch keeps GPS backup power
+// (AXP2101 LDO1 / VRTC) permanently on, so the setting survives reboots. We also
+// re-send it on every boot, so it is robust even if backup power is ever lost.
+// LilyGoLib drives the GPS on the global Serial1 @ 38400 (see LilyGoLib
+// initGPS()), so we can write UBX frames straight to Serial1.
+// NOTE: changing the constellation set restarts the GNSS engine, so the first
+// fix right after a config change is effectively a cold start (longer TTFF once).
+// ═══════════════════════════════════════════════════════════
+static void ubxSend(uint8_t cls, uint8_t id, const uint8_t* payload, uint16_t len) {
+    uint8_t hdr[6] = {0xB5,0x62,cls,id,(uint8_t)(len&0xFF),(uint8_t)(len>>8)};
+    uint8_t ckA=0, ckB=0;
+    for (int i=2;i<6;i++){ ckA+=hdr[i]; ckB+=ckA; }             // 8-bit Fletcher over
+    for (uint16_t i=0;i<len;i++){ ckA+=payload[i]; ckB+=ckA; }  // class..end of payload
+    Serial1.write(hdr,6);
+    if (len) Serial1.write(payload,len);
+    Serial1.write(ckA); Serial1.write(ckB);
+    Serial1.flush();
+}
+
+// Wait for a UBX-ACK-ACK (0x05 0x01) / ACK-NAK (0x05 0x00) matching the given
+// message class/id. Scans the Serial1 byte stream (which also carries NMEA) for
+// the UBX sync 0xB5 0x62 and verifies the checksum. Runs in setup() before the
+// main loop, so there is no contention with instance.gps.loop().
+// Returns: 1 = ACK, 0 = NAK, -1 = timeout.
+static int ubxWaitAck(uint8_t forCls, uint8_t forId, uint32_t timeoutMs) {
+    uint32_t start = millis();
+    uint8_t  st = 0, mCls = 0, mId = 0, p0 = 0, p1 = 0, ckA = 0, ckB = 0, rxA = 0;
+    uint16_t len = 0, idx = 0;
+    while (millis() - start < timeoutMs) {
+        if (!Serial1.available()) { delay(2); continue; }
+        uint8_t c = Serial1.read();
+        switch (st) {
+        case 0: if (c == 0xB5) st = 1; break;
+        case 1: st = (c == 0x62) ? 2 : (c == 0xB5 ? 1 : 0); break;
+        case 2: mCls = c; ckA = c; ckB = c; st = 3; break;
+        case 3: mId = c; ckA += c; ckB += ckA; st = 4; break;
+        case 4: len = c; ckA += c; ckB += ckA; st = 5; break;
+        case 5: len |= (uint16_t)c << 8; ckA += c; ckB += ckA; idx = 0; st = (len == 0) ? 7 : 6; break;
+        case 6:
+            if (idx == 0) p0 = c; else if (idx == 1) p1 = c;
+            ckA += c; ckB += ckA;
+            if (++idx >= len) st = 7;
+            break;
+        case 7: rxA = c; st = 8; break;                 // CK_A
+        case 8:                                          // CK_B
+            if (rxA == ckA && c == ckB && mCls == 0x05 &&
+                (mId == 0x01 || mId == 0x00) && p0 == forCls && p1 == forId) {
+                return (mId == 0x01) ? 1 : 0;
+            }
+            st = 0;   // not our ack (or bad checksum) → keep scanning
+            break;
+        }
+    }
+    return -1;
+}
+
+static void configGnssGlonass() {
+    // UBX-CFG-VALSET: version=0, layers=RAM|BBR(0x03), reserved(2), key/value pairs.
+    // Keys are 4-byte little-endian; value for an L(bool) item is 1 byte.
+    //   CFG-SIGNAL-BDS_ENA (0x10310022) = 0  -> BeiDou OFF
+    //   CFG-SIGNAL-GLO_ENA (0x10310025) = 1  -> GLONASS ON
+    static const uint8_t payload[] = {
+        0x00, 0x03, 0x00, 0x00,
+        0x22, 0x00, 0x31, 0x10, 0x00,   // BDS_ENA = 0
+        0x25, 0x00, 0x31, 0x10, 0x01,   // GLO_ENA = 1
+    };
+    delay(100);   // let the module settle after power-up before configuring
+    ubxSend(0x06, 0x8A, payload, sizeof(payload));
+    int ack = ubxWaitAck(0x06, 0x8A, 1500);   // CFG-VALSET is class 0x06, id 0x8A
+    logWrite(ack == 1 ? "GNSS: BeiDou off, GLONASS on (ACK)"
+           : ack == 0 ? "GNSS config REJECTED by module (NAK)"
+                      : "GNSS config: no ACK (timeout)");
+}
+
+// ═══════════════════════════════════════════════════════════
 // Setup
 // ═══════════════════════════════════════════════════════════
 void setup() {
@@ -628,6 +716,11 @@ void setup() {
     // Accelerometer for shake-to-wake at 25Hz
     if (instance.getDeviceProbe() & HW_BHI260AP_ONLINE) {
         accel.enable(25.0f, 0);
+    }
+
+    // Switch GNSS to GPS + Galileo + GLONASS (BeiDou off) — see notes above configGnssGlonass()
+    if (instance.getDeviceProbe() & HW_GPS_ONLINE) {
+        configGnssGlonass();
     }
 
     // SD check — instance.begin() already mounts SD internally.
@@ -713,6 +806,8 @@ void setup() {
     lv_obj_set_width(lblBatSd,390);
     lv_obj_align(lblBatSd,LV_ALIGN_TOP_MID,0,425);
 
+    wantConnected = true;   // auto-connect on boot, retry every 5s until camera found
+    triggerConnect = true;
     xTaskCreate(bleTask,"ble",8192,NULL,1,NULL);
 }
 
@@ -735,7 +830,7 @@ void loop() {
         float mag=sqrtf(x*x+y*y+z*z);
         float delta=fabsf(mag-prevAccelMag);
         prevAccelMag=mag;
-        if (delta>8.0f) { wakeDisplay(); logWrite("Wake by shake"); }
+        if (delta>2.0f) { wakeDisplay(); logWrite("Wake by shake"); }
     }
 
     if (!firstFix && instance.gps.location.isValid()) {

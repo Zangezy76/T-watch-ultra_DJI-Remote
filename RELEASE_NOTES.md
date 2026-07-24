@@ -38,7 +38,7 @@ This release ships as an Arduino sketch, not a pre-built web-flash binary.
    [`WORKING_LIBRARIES.md`](WORKING_LIBRARIES.md) — do **not** let Arduino IDE
    auto-update them (LilyGoLib 0.1.0, SensorLib 0.3.3, RadioLib 7.4.0,
    LVGL 9.4.0, NimBLE-Arduino 2.5.0, TinyGPSPlus).
-3. Open `arduino/DJI_TWatch_Remote/DJI_TWatch_Remote.ino`.
+3. Open `arduino/DJI_Remote_T-Watch/DJI_Remote_T-Watch.ino`.
 4. Select board: **LILYGO T-Watch Ultra (SX1262)**.
 5. Set your camera's BLE MAC in the sketch:
    ```cpp

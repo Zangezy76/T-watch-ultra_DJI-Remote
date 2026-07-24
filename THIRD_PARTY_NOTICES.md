@@ -115,7 +115,7 @@ https://www.apache.org/licenses/LICENSE-2.0
 
 # 7. Arduino Port Dependencies (T-Watch Ultra Build)
 
-The Arduino / LilyGoLib port (`arduino/DJI_TWatch_Remote/`) depends on the
+The Arduino / LilyGoLib port (`arduino/DJI_Remote_T-Watch/`) depends on the
 third-party libraries below. Exact working versions are pinned in
 `WORKING_LIBRARIES.md`.
 

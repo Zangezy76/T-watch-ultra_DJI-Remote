@@ -26,7 +26,7 @@ A custom BLE remote control for DJI Osmo Action 5 Pro built on LILYGO T-Watch Ul
 | **IMU** | BHI260AP (shake-to-wake) |
 | **Battery** | 1100 mAh, IP65, ~10h runtime |
 | **Camera** | DJI Osmo Action 5 Pro |
-| **Camera MAC** | See `arduino/DJI_TWatch_Remote/DJI_TWatch_Remote.ino` |
+| **Camera MAC** | See `arduino/DJI_Remote_T-Watch/DJI_Remote_T-Watch.ino` |
 
 ---
 
@@ -129,7 +129,7 @@ One file per day on SD card:
 
 ### Flash
 
-1. Open `arduino/DJI_TWatch_Remote/DJI_TWatch_Remote.ino` in Arduino IDE
+1. Open `arduino/DJI_Remote_T-Watch/DJI_Remote_T-Watch.ino` in Arduino IDE
 2. Select board: **LILYGO T-Watch Ultra (SX1262)**
 3. Set your camera MAC address in the sketch:
 ```cpp
@@ -144,7 +144,7 @@ static const char* CAMERA_MAC = "xx:xx:xx:xx:xx:xx";
 ```
 DJI-Remote/
 ├── arduino/
-│   └── DJI_TWatch_Remote/      ← Main Arduino sketch
+│   └── DJI_Remote_T-Watch/     ← Main Arduino sketch
 ├── protocol/                   ← DJI BLE protocol (ESP-IDF, C)
 ├── ble/                        ← BLE layer
 ├── logic/                      ← Command logic
