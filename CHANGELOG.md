@@ -8,6 +8,79 @@ ESP-IDF firmware for M5Stack / Waveshare boards that this project was forked
 from; that firmware still lives in the repo (`protocol/`, `ble/`, `logic/`,
 `main/`, `sdkconfig.defaults.*`) and serves as the protocol reference.
 
+## [v2.1.0] — 2026-10 — Camera state, confirmed recording, GPX per day
+
+A code review of the Arduino port plus on-device tests and an analysis of field
+logs (26–27.08.2026). The DJI BLE details below were checked against DJI's
+official [Osmo-GPS-Controller-Demo](https://github.com/dji-sdk/Osmo-GPS-Controller-Demo)
+and a dump of the camera's notifications.
+
+### Added
+
+- **Camera state from its battery heartbeat** — While awake, the camera pushes its
+  battery state once a second (DUML frame `0x55`, CMD_SET `0x0D` / CMD_ID `0x02`).
+  It drives the status line: `Cam:72%` (awake, camera battery), `Cam:zz` (switched
+  off but BLE still linked), `Cam:wake`, `Cam:--`, `Cam:~~`.
+- **Confirmed recording** — REC is sent with a reply request (CmdType `0x01`);
+  the watch shows REC only after the camera answers `ret_code = 0`, otherwise a
+  long buzz.
+- **Wake-on-REC** — A tap while the camera sleeps wakes it with `WKP` advertising
+  (as in DJI's demo), waits for the heartbeat, then starts recording (~3 s),
+  retrying while the camera is not ready yet (`ret 223`).
+- **One GPX track per day** — `/track_YYYY_MM_DD.gpx` + `_wpt.gpx`; switching the
+  logger on again the same day appends a new `<trkseg>` after checking the file tail.
+- **BITE is never lost** — With the logger off, BITE goes to the day's waypoint file.
+- **Logger resume after a crash** — RTC memory keeps the track across panic,
+  watchdog and brownout resets (not power-off); the reset reason is logged at boot.
+- **Read-only SD access over USB serial** — `ls`, `cat <path>`.
+- **BLE debug dump** — `DEBUG_BLE_DUMP` (off by default) writes every FFF4
+  notification and sent command to `/ble_dump.txt`, decoded where known.
+
+### Changed
+
+- **GPS injection uses DJI's 48-byte layout** (uint32 accuracies, uint32
+  satellites, time as UTC+8) from the official demo; the old 45-byte layout stays
+  behind `GPS_FRAME_LEGACY`. On every connection both layouts are sent once with a
+  reply request and the camera's answers are logged. *Not field-verified yet.*
+- **Logger toggle = hold 1.5 s** (was a 0.6 s long tap), firing while the finger is
+  still down. Field logs showed slow taps / a wet screen toggling the logger, which
+  split trips into 12–15 files a day and lost 3 of 6 BITE marks.
+- **Touch zones** split exactly at the drawn line (y = 318); icons replace glyphs
+  missing from the font (`●■▶─` were drawn as boxes).
+- **Non-blocking haptics** — no `delay()` in touch handlers.
+- **No UI redraws while the screen is dark.**
+- **No GPS writes to a sleeping camera** — this also ends the `GPS inject FAIL` log
+  flood (up to 29 000 lines a day).
+
+### Fixed
+
+- **Thread safety** — LVGL and SD were used from the BLE task and the NimBLE host
+  task; the write characteristic could be freed while in use. Now LVGL, SD and GPS
+  are touched only from `loop()`, camera writes only from the BLE task.
+- **A tap on the dark screen started/stopped recording** — it now only wakes the display.
+- **Fast double tap missed** — the 250 ms debounce swallowed the second tap; the
+  double tap is now measured as the gap between release and the next press.
+- **Phantom tap after lift-off** — a touch IRQ without a point became a tap with
+  bogus coordinates; such IRQs are now ignored.
+- **Corrupted GPX on restart** — `FILE_APPEND` added a second header to an existing
+  file; the closing-tag length was off by one (29 → 30).
+- **Stale GPS position** — `location.isValid()` stays true after the fix is lost;
+  a fix now also needs `age() < 3 s`.
+- **Zero GPS date** accepted as valid (`log_2000_00_00.txt`, `track_2000_00_00_*.gpx`).
+- **BLE** — no retry after a failed service discovery; a `CameraCallbacks` object
+  leaked on every connection attempt.
+- **False confirmations** — "recording started" buzz without a camera, "BITE saved"
+  with the logger off.
+
+### Known limitations
+
+- Recording started with the camera's own button is not seen by the watch: status
+  push `1D02` does not arrive without the `0x00/0x19` connection handshake.
+- After a USB upload the watch may take up to ~3 minutes to start.
+- Field battery life is ~8 h (BLE + GPS + screen), not the estimated ~10 h.
+
+---
+
 ## [v2.0.0] — 2026-06 — T-Watch Ultra Arduino port
 
 A from-scratch Arduino implementation for the **LILYGO T-Watch Ultra**

@@ -6,11 +6,14 @@ A custom BLE remote control for DJI Osmo Action 5 Pro built on LILYGO T-Watch Ul
 
 ## ✨ Features
 
-- **BLE Camera Control** — Start/stop recording with a tap
+- **BLE Camera Control** — Start/stop recording with a tap; REC lights up only after the camera confirms the command
+- **Wake a Sleeping Camera** — The camera keeps BLE alive when switched off; a tap wakes it and starts recording
+- **Camera State on the Watch** — Awake / asleep / link lost, plus the camera's own battery level
 - **GPS Injection** — Real-time coordinates sent to camera every second, GPS overlay confirmed working in DJI Mimo
-- **GPX Logger** — Track recording with waypoints (REC START/STOP, fishing spots) saved to SD card
+- **GPX Logger** — One track per day (a new segment for each session) with waypoints (REC START/STOP, fishing spots); BITE marks are saved even when the logger is off
 - **Display Sleep** — Auto-off after 1 minute, wake by wrist shake
-- **Two Touch Zones** — Upper 2/3 = camera control, lower 1/3 = logger control
+- **Two Touch Zones** — Upper zone = camera control, lower zone = logger and waypoints
+- **Logs over USB** — Read-only access to the SD card over the USB serial port, no need to remove the card
 
 ![GPS Overlay in DJI Mimo](docs/images/mimo_overlay.jpg)
 ![T-Watch Ultra UI](docs/images/watch_ui.jpg)
@@ -24,7 +27,7 @@ A custom BLE remote control for DJI Osmo Action 5 Pro built on LILYGO T-Watch Ul
 | **Display** | 2.01" AMOLED 410×502, CO5300 |
 | **GPS** | u-blox MIA-M10Q (built-in) |
 | **IMU** | BHI260AP (shake-to-wake) |
-| **Battery** | 1100 mAh, IP65, ~10h runtime |
+| **Battery** | 1100 mAh, IP65, ~8 h in the field (BLE + GPS + screen) |
 | **Camera** | DJI Osmo Action 5 Pro |
 | **Camera MAC** | See `arduino/DJI_Remote_T-Watch/DJI_Remote_T-Watch.ino` |
 
@@ -34,25 +37,30 @@ A custom BLE remote control for DJI Osmo Action 5 Pro built on LILYGO T-Watch Ul
 
 ```
 ┌─────────────────────────┐
-│  08:42 UTC    ● REC     │
+│  08:42 UTC   [cam] REC  │
 │                         │  ← TAP = start/stop recording
 │    55.79567             │    DOUBLE TAP = connect camera
 │    37.80550             │
 │  5.4 km/h   230 m       │
-│  Cam: OK   Sat: 8       │
-├─────────────────────────┤
-│  ▶ LOG: ON              │  ← LONG TAP = start/stop GPX logger
+│  Cam:72% GPS:||||. 8    │
+├─────────────────────────┤  ← zone border (y = 318)
+│  ▶ LOG: ON              │  ← HOLD 1.5 s = start/stop GPX logger
 │  Bat: 94%    SD: OK     │    DOUBLE TAP = save waypoint (BITE)
 └─────────────────────────┘
 ```
 
 | Action | Zone | Result |
 |--------|------|--------|
-| Tap | Upper (2/3) | Start / Stop recording |
-| Double tap | Upper (2/3) | Connect to camera |
-| Long tap | Lower (1/3) | Start / Stop GPX logger |
-| Double tap | Lower (1/3) | Save waypoint "BITE N" |
-| Wrist shake | — | Wake display |
+| Tap | Upper | Start / Stop recording (after the camera confirms) |
+| Tap while `Cam:zz` | Upper | Wake the camera and start recording (~3 s) |
+| Double tap | Upper | Connect to camera |
+| Hold 1.5 s | Lower | Start / Stop GPX logger — buzzes while you hold, then let go |
+| Double tap | Lower | Save waypoint "BITE N" (even with the logger off) |
+| Tap on a dark screen / wrist shake | — | Wake display only |
+
+**Camera status line:** `Cam:72%` awake (camera battery) · `Cam:zz` switched off / asleep, BLE link still up · `Cam:wake` being woken for REC · `Cam:--` searching · `Cam:~~` link lost, reconnecting.
+
+**Vibration:** 1 = recording started / logger toggled · 2 = recording stopped · 3 = BITE saved · soft bump = waking the camera · long buzz = not done (camera did not confirm / not connected; for BITE — no GPS fix, date or SD).
 
 ---
 
@@ -67,42 +75,58 @@ Reverse-engineered from the original [DJI-Remote](https://github.com/nicholaswil
 
 | Command | CMD_SET | CMD_ID | Notes |
 |---------|---------|--------|-------|
-| Start recording | 0x1D | 0x03 | device_id + 0x00 |
+| Start recording | 0x1D | 0x03 | device_id + 0x00; reply `ret_code` (0 = done) |
 | Stop recording | 0x1D | 0x03 | device_id + 0x01 |
-| GPS injection | 0x00 | 0x17 | 45 bytes struct |
+| GPS injection | 0x00 | 0x17 | 48-byte layout from DJI's demo (time as UTC+8) |
 | Switch mode | 0x1D | 0x04 | Video/Photo/Night/etc |
+| Status subscription | 0x1D | 0x05 | push_mode=3, push_freq=20 — accepted, but status 1D02 does not arrive without the 0x00/0x19 handshake |
+| Battery push (from camera) | 0x0D | 0x02 | DUML frame (SOF 0x55), 1 Hz while the camera is awake — used as a heartbeat; byte 31 = battery % |
+| Wake-up | — | — | BLE advertising: manufacturer data `WKP` + camera MAC reversed, 2 s |
 
-- **CRC16:** DJI Fletcher, init=0x3AA3
-- **CRC32:** DJI Fletcher, init=0x00003AA3
+- **CmdType:** 0x00 no reply, 0x01 reply requested, 0x02 reply mandatory; bit 5 marks a reply frame. A reply carries the same SEQ, payload[0] = `ret_code`.
+- **CRC16:** table-driven CRC-16 (0xA001 table, as CRC-16/ARC), init=0x3AA3, over bytes 0–9
+- **CRC32:** table-driven CRC-32 (0xEDB88320 table), init=0x00003AA3, no final XOR
 - **BLE Service:** 0xFFF0 | Write: 0xFFF3 | Notify: 0xFFF4
+- Official reference: [dji-sdk/Osmo-GPS-Controller-Demo](https://github.com/dji-sdk/Osmo-GPS-Controller-Demo)
 
 ---
 
 ## 📂 GPX Output
 
-One file per day on SD card:
+One track file per day on SD card; every time the logger is switched on again the
+same day, a new `<trkseg>` segment starts in the same file:
 
 ```
-/track_2026_05_24.gpx   ← track points every minute
-/log_2026_05_24.txt     ← event log with timestamps
+/track_2026_05_24.gpx       ← track points every minute (skipped while the GPS fix is lost)
+/track_2026_05_24_wpt.gpx   ← waypoints of the day (BITE always, REC START/STOP while logging)
+/log_2026_05_24.txt         ← event log with timestamps
 ```
+
+Before the GPS knows the date, the logger writes `/track_session_NNN.gpx` instead.
 
 **Track point:**
 ```xml
 <trkpt lat="55.795849" lon="37.804908">
-    <ele>5.0</ele>
-    <time>2026-05-24T07:23:15Z</time>
-    <speed>2.1</speed>
+  <ele>5.0</ele>
+  <time>2026-05-24T07:23:15Z</time>
 </trkpt>
 ```
 
 **Waypoint (fishing spot / REC markers):**
 ```xml
 <wpt lat="55.795849" lon="37.804908">
-    <time>2026-05-24T07:23:15Z</time>
-    <name>BITE 1</name>
+  <ele>5.0</ele>
+  <time>2026-05-24T07:23:15Z</time>
+  <name>BITE 1</name>
 </wpt>
 ```
+
+Waypoints live in a separate file because the track is appended by seeking back over
+its closing tags, and GPX 1.1 requires `<wpt>` before `<trk>`.
+
+**Logs over USB:** with the watch on USB (Serial Monitor closed), send `ls` or
+`cat /log_2026_05_24.txt` at 115200 baud; the file comes back between
+`<<<BEGIN path size>>>` and `<<<END>>>`.
 
 ---
 
@@ -110,8 +134,8 @@ One file per day on SD card:
 
 ### Requirements
 
-- Arduino IDE 2.x
-- Board: **esp32 by Espressif Systems 3.3.8**
+- Arduino IDE 2.x (or arduino-cli)
+- Board: **esp32 by Espressif Systems 3.3.12** (3.3.8 used up to v2.0.0)
 - Board config: **LILYGO T-Watch Ultra**
 
 ### Libraries (exact versions required)
@@ -123,7 +147,7 @@ One file per day on SD card:
 | RadioLib | 7.4.0 | LilyGoLib-ThirdParty ⚠️ do not update |
 | lvgl | 9.4.0 | LilyGoLib-ThirdParty ⚠️ do not update |
 | NimBLE-Arduino | 2.5.0 | Arduino Library Manager |
-| TinyGPSPlus | built-in | Part of LilyGoLib |
+| TinyGPSPlus | 1.1.0 | Separate library; LilyGoLib's `GPS` class derives from it |
 | NFC-RFAL-fork | 1.0.1 | [github.com/lewisxhe/NFC-RFAL-fork](https://github.com/lewisxhe/NFC-RFAL-fork) |
 | ST25R3916-fork | 1.1.0 | [github.com/lewisxhe/ST25R3916-fork](https://github.com/lewisxhe/ST25R3916-fork) |
 
@@ -136,6 +160,15 @@ One file per day on SD card:
 static const char* CAMERA_MAC = "xx:xx:xx:xx:xx:xx";
 ```
 4. Upload via COM port (auto-detected, no button press needed)
+
+Or from the command line:
+```bash
+arduino-cli compile --fqbn esp32:esp32:twatch_ultra -u -p COM6 arduino/DJI_Remote_T-Watch
+```
+
+> Arduino IDE may upload stale text from an already open tab after the file was changed
+> outside the IDE — reopen the sketch before uploading. After a USB upload the watch can
+> take up to ~3 minutes to start; a normal power-on takes ~5 s.
 
 ---
 
@@ -158,9 +191,13 @@ DJI-Remote/
 
 ## 🔑 Key Technical Notes
 
-- **GPS:** Use `instance.gps` (LilyGoLib), do **not** create `HardwareSerial` manually
+- **GPS:** Use `instance.gps` (LilyGoLib), do **not** create `HardwareSerial` manually. TinyGPSPlus keeps `location.isValid()` true forever after the first fix — check `location.age()`; it also reports a zero date as valid
 - **BLE:** All BLE operations in a FreeRTOS task — calling `connect()` from `setup()` hangs the system
-- **LVGL:** Update UI via flags from BLE task, never directly
+- **Threads:** LVGL, SD and `instance.gps` only from `loop()`; camera writes only from the BLE task; other tasks log through a queue
+- **Camera power:** the Osmo Action 5 Pro keeps the BLE link when switched off, so "connected" ≠ "on". Its 1 Hz battery push is the awake signal. A sleeping camera queues writes and replays them all on wake-up — never send it commands; wake it first
+- **Write vs. done:** a BLE write without response only means "sent"; request a reply (CmdType 0x01) to know the camera executed it
+- **Touch:** `getTouched()` only reports the IRQ flag; right after lift-off the panel raises one more IRQ without a point — count a touch only when `getPoint()` returns a point
+- **Fonts:** the built-in Montserrat has only ASCII, `°`, `•` and `LV_SYMBOL_*` icons — other glyphs render as boxes
 - **Display:** 2.01" AMOLED has rounded corners — keep content 50px+ from edges
 
 ---
