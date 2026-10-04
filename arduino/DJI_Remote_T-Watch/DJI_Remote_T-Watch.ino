@@ -2,11 +2,14 @@
  * DJI Osmo Action 5 Pro BLE Remote on LILYGO T-Watch Ultra
  *
  * Features:
- *   - BLE camera control (start/stop recording)
+ *   - BLE camera control: REC confirmed by the camera's reply; a sleeping
+ *     camera is woken up first; camera awake/asleep + battery % on screen
  *   - Real-time GPS injection → overlay in DJI Mimo
- *   - GPX track logger with waypoints (SD card)
- *   - Two touch zones: upper=camera, lower=logger
+ *   - GPX track logger: one file per day, new segment per session,
+ *     BITE waypoints saved even with the logger off (SD card)
+ *   - Two touch zones: upper=camera, lower=logger (hold 1.5 s) / BITE
  *   - Display auto-sleep + wake by wrist shake (BHI260AP)
+ *   - Read-only SD access over USB serial ("ls", "cat <path>")
  *
  * Hardware:
  *   - LILYGO T-Watch Ultra (ESP32-S3R8, BLE 5.0)
@@ -37,9 +40,10 @@ static const uint32_t DEVICE_ID = 0x00000015;
 // instance.begin() already mounts SD internally — use SD.exists("/") to check.
 #define TRKSEG_CLOSE     "    </trkseg>\n  </trk>\n"
 #define GPX_CLOSE        "</gpx>\n"
-#define TRKSEG_CLOSE_LEN 22
-#define GPX_CLOSE_LEN    7
-#define FULL_CLOSE_LEN   29
+// Lengths derived from the strings (hard-coded 22/29 were off by one)
+#define TRKSEG_CLOSE_LEN (sizeof(TRKSEG_CLOSE)-1)
+#define GPX_CLOSE_LEN    (sizeof(GPX_CLOSE)-1)
+#define FULL_CLOSE_LEN   (TRKSEG_CLOSE_LEN+GPX_CLOSE_LEN)
 static char  gpxPath[32] = "";
 static bool  sdReady     = false;
 static bool  gpxLogging  = false;
@@ -65,10 +69,11 @@ static bool displayOn = true;
 // ─── Accelerometer for shake-to-wake ─────────────────────
 SensorXYZ accel(SensorBHI260AP::ACCEL_PASSTHROUGH, instance.sensor);
 static float prevAccelMag = 0.0f;
+static bool  accelPrimed  = false;   // first sample after sleep is only a baseline
 static uint32_t sleepStartMs = 0;
 
 // ─── UI widgets ───────────────────────────────────────────
-#define ZONE_SPLIT 335
+#define ZONE_SPLIT 318   // touch boundary; the blue zone line is drawn here (was 335 vs line at 318)
 static lv_obj_t* lblTime   = nullptr;
 static lv_obj_t* lblRec    = nullptr;
 static lv_obj_t* lblCoords = nullptr;
@@ -78,18 +83,78 @@ static lv_obj_t* lblLog    = nullptr;
 static lv_obj_t* lblBatSd  = nullptr;
 
 // ─── BLE state ────────────────────────────────────────────
+// Thread ownership (LVGL, SD and TinyGPS are not thread-safe):
+//   loop()       — LVGL, SD, instance.gps, isRecording
+//   bleTask      — pClient, pWriteChr, seqNum (every write to the camera)
+//   onDisconnect — NimBLE host task, only sets flags
 static NimBLEClient*               pClient   = nullptr;
 static NimBLERemoteCharacteristic* pWriteChr = nullptr;
 static volatile bool connected      = false;
-static volatile bool isRecording    = false;
+static volatile bool camLost        = false;   // link dropped, reconnecting (UI: orange "~~")
+static volatile int  disconnectReason = 0;
+static bool          isRecording    = false;
 static uint16_t      seqNum         = 0;
 static volatile bool triggerConnect = false;
+static volatile bool wakeReq        = false;   // loop() → bleTask: send wake-up advertising
+// REC while not connected. A camera that fell asleep without a link (watch reboot, out of
+// range) takes no connection until it is woken — seen twice: 7 min of "BLE connect FAIL"
+// until it was switched on by hand. loop() sets wakeLinkMs on the tap; bleTask sends the
+// wake-up before every connect attempt while it is set (WAKE_LINK_MS at most) and, if
+// recOnLink, starts recording once linked. A double tap wakes + connects without REC.
+#define WAKE_LINK_MS 60000
+static volatile uint32_t wakeLinkMs = 0;   // millis() of the request, 0 = none
+static volatile bool     recOnLink  = false;
+
+// Camera awake/asleep. The camera keeps the BLE link while switched off, so
+// "connected" alone means nothing. While awake it pushes its battery state once
+// a second (DUML 0D/02, see onCamNotify); silence = asleep. A 3 s gap was seen
+// while awake, hence 6 s. If no push was ever seen on this link (other firmware?)
+// the state is unknown and the watch behaves as before.
+#define CAM_HEARTBEAT_MS 6000   // signed on purpose, see msSince()
+static volatile uint32_t camHeartbeatMs = 0;   // millis() of the last battery push, 0 = none yet
+static volatile uint32_t camLinkMs      = 0;   // millis() when the current link came up
+static volatile uint8_t  camBattPct     = 0;
+static volatile bool     camWaking      = false;   // bleTask is waking the camera for REC
+
+// REC reply handoff: onCamNotify (NimBLE host task) → bleTask
+static volatile bool     recRespNew = false;
+static volatile uint16_t recRespSeq = 0;
+static volatile uint8_t  recRespRet = 0;
+// Key report reply handoff (0x00/0x11): onCamNotify → bleTask
+static volatile bool     keyRespNew = false;
+static volatile uint16_t keyRespSeq = 0;
+static volatile uint8_t  keyRespRet = 0;
+
+// BLE dump for step 24 research (see "BLE dump" below). Declared up here because
+// Arduino inserts its generated function prototypes before the first function.
+#define DEBUG_BLE_DUMP 0
+#define DUMP_MAX_LEN   160
+enum { DUMP_RX = 0, DUMP_TX = 1, DUMP_NOTE = 2 };
+struct DumpItem { uint32_t ms; uint8_t dir; uint16_t len; uint8_t data[DUMP_MAX_LEN]; };
+
+// REC command handoff: loop() → bleTask → loop()
+#define REC_FAILED 2
+// REC on a sleeping camera. 1 = as DJI's own remote: wake-up advertising + SNAPSHOT key
+// (0x00/0x11, key 0x03) — the camera records and goes back to sleep after STOP.
+// 0 = wake, wait for the heartbeat, then 1D03 START (the camera stays on after STOP).
+#define SLEEP_SNAPSHOT 1
+static volatile int8_t recCmd  = 0;   // +1 start, -1 stop; set by loop(), cleared by bleTask
+static volatile int8_t recDone = 0;   // +1/-1 sent OK, REC_FAILED; set by bleTask, cleared by loop()
+
+// GPS injection handoff: loop() snapshots instance.gps, bleTask sends it.
+static portMUX_TYPE  gpsMux = portMUX_INITIALIZER_UNLOCKED;
+static uint8_t       gpsPayload[48];         // DJI demo layout, see buildGpsPayload()
+static volatile bool gpsPayloadReady = false;
+static uint32_t      lastGpsPayloadMs = 0;
 
 static uint32_t lastUiUpdate = 0;
 
 // ─── Touch state ──────────────────────────────────────────
+#define LOGGER_HOLD_MS 1500   // was 600: slow taps / wet screen toggled the logger by accident
 static uint32_t touchStartMs = 0;
 static bool touchActive = false;
+static bool touchWasOn = false;       // display was on when this touch began
+static bool touchHoldFired = false;   // logger hold already handled for this touch
 static int16_t touchX = 0, touchY = 0;
 static uint32_t lastTouchMs = 0;
 
@@ -179,11 +244,19 @@ uint32_t dji_crc32(const uint8_t* d, size_t l) {
     return crc;
 }
 
-size_t dji_build_frame(uint8_t* buf, uint8_t cmd_set, uint8_t cmd_id,
+// CmdType byte (DJI Osmo-GPS-Controller-Demo, enums_logic.h):
+// bits 4..0 = response policy, bit 5 = 1 for a response frame.
+// The camera answers a command with the same SEQ.
+#define DJI_CMD_NO_RESPONSE   0x00
+#define DJI_CMD_RESPONSE_OPT  0x01   // response requested, absence is not an error
+#define DJI_CMD_WAIT_RESULT   0x02   // response mandatory
+#define DJI_FRAME_IS_RESPONSE 0x20
+
+size_t dji_build_frame(uint8_t* buf, uint8_t cmd_set, uint8_t cmd_id, uint8_t cmd_type,
                        const uint8_t* data, size_t data_len, uint16_t seq) {
     size_t total=14+data_len+4, off=0;
     buf[off++]=0xAA; buf[off++]=total&0xFF; buf[off++]=(total>>8)&0xFF;
-    buf[off++]=0x00; buf[off++]=0x00;
+    buf[off++]=cmd_type; buf[off++]=0x00;
     buf[off++]=0x00; buf[off++]=0x00; buf[off++]=0x00;
     buf[off++]=seq&0xFF; buf[off++]=(seq>>8)&0xFF;
     uint16_t c16=dji_crc16(buf,off);
@@ -196,12 +269,70 @@ size_t dji_build_frame(uint8_t* buf, uint8_t cmd_set, uint8_t cmd_id,
     return off;
 }
 
+// Camera state from the battery heartbeat (see CAM_HEARTBEAT_MS). A link with no
+// push for CAM_HEARTBEAT_MS since it came up = connected to an already sleeping camera.
+static bool camHeartbeatSeen() { return camHeartbeatMs != 0; }
+// The stamp is written by the NimBLE host task on the other core: compare signed, so a
+// stamp that is momentarily newer than this core's millis() reads as "just now".
+static int32_t msSince(uint32_t t) { return (int32_t)(millis()-t); }
+static bool camAwake()  { uint32_t t=camHeartbeatMs; return t && msSince(t) < CAM_HEARTBEAT_MS; }
+static bool camAsleep() {
+    uint32_t t=camHeartbeatMs;
+    if (t) return msSince(t) >= CAM_HEARTBEAT_MS;
+    return connected && msSince(camLinkMs) >= CAM_HEARTBEAT_MS;
+}
+
+// ═══════════════════════════════════════════════════════════
+// GPS fix freshness
+// TinyGPSPlus location.isValid() stays true forever after the first fix
+// (location is committed only from sentences with a fix), so without an age
+// check a lost signal keeps returning the last position. Receiver runs at 1 Hz.
+// ═══════════════════════════════════════════════════════════
+#define GPS_FIX_MAX_AGE_MS 3000UL
+static bool gpsFixLive() {
+    return instance.gps.location.isValid() && instance.gps.location.age() < GPS_FIX_MAX_AGE_MS;
+}
+
+// TinyGPSPlus also marks an empty/zero date as valid (it produced log_2000_00_00.txt
+// and track_2000_00_00_0000.gpx), so check the values too
+static bool gpsDateOk() {
+    return instance.gps.date.isValid() && instance.gps.date.year() >= 2024 &&
+           instance.gps.date.month() >= 1 && instance.gps.date.day() >= 1;
+}
+
+// ═══════════════════════════════════════════════════════════
+// Haptics — non-blocking: pulse sequences are played from loop(),
+// so touch handlers never delay() (it stalled LVGL and NMEA parsing).
+// A new sequence replaces one still pending.
+// ═══════════════════════════════════════════════════════════
+#define DOUBLE_TAP_MS 400
+static uint8_t  hapticEffect = 0, hapticLeft = 0;
+static uint16_t hapticGapMs  = 0;
+static uint32_t hapticNextMs = 0;
+
+static void hapticSeq(uint8_t effect, uint8_t count, uint16_t gapMs, uint16_t startDelayMs) {
+    hapticEffect=effect; hapticLeft=count; hapticGapMs=gapMs;
+    hapticNextMs=millis()+startDelayMs;
+}
+static void haptic(uint8_t effect) { hapticSeq(effect,1,0,0); }
+static void serviceHaptics() {
+    if (hapticLeft && (int32_t)(millis()-hapticNextMs)>=0) {
+        instance.setHapticEffects(hapticEffect); instance.vibrator();
+        hapticLeft--; hapticNextMs=millis()+hapticGapMs;
+    }
+}
+
+// Long 750 ms buzz (DRV2605 effect 15) = "action not done"
+static void hapticError() { haptic(15); }
+
 // ═══════════════════════════════════════════════════════════
 // Display
 // ═══════════════════════════════════════════════════════════
 void wakeDisplay() {
     if (!displayOn) {
         displayOn = true;
+        updateUI();                 // UI is not refreshed while dark — show fresh data at once
+        lastUiUpdate = millis();
         instance.setBrightness(200);
     }
     lastActivityMs = millis();
@@ -209,11 +340,23 @@ void wakeDisplay() {
 
 // ═══════════════════════════════════════════════════════════
 // SD Event Log
+// Lines from other tasks are queued and written by loop(), so SD and the
+// GPS timestamp are touched from one thread only.
 // ═══════════════════════════════════════════════════════════
+#define LOG_MSG_LEN 128
+static TaskHandle_t  mainTask = nullptr;
+static QueueHandle_t logQueue = nullptr;
+
 void logWrite(const char* msg) {
+    if (xTaskGetCurrentTaskHandle() != mainTask) {
+        char item[LOG_MSG_LEN];
+        strncpy(item, msg, sizeof(item)-1); item[sizeof(item)-1] = '\0';
+        if (!logQueue || xQueueSend(logQueue, item, 0) != pdTRUE) Serial.println(msg);
+        return;
+    }
     Serial.println(msg);
     if (!sdReady) return;
-    if (instance.gps.date.isValid() && instance.gps.date.day() != lastLogDay) {
+    if (gpsDateOk() && instance.gps.date.day() != lastLogDay) {
         lastLogDay = instance.gps.date.day();
         snprintf(logPath, sizeof(logPath), "/log_%04d_%02d_%02d.txt",
             instance.gps.date.year(), instance.gps.date.month(), instance.gps.date.day());
@@ -221,66 +364,256 @@ void logWrite(const char* msg) {
     if (logPath[0] == '\0') snprintf(logPath, sizeof(logPath), "/log_nodate.txt");
     File f = SD.open(logPath, FILE_APPEND);
     if (!f) return;
-    if (instance.gps.time.isValid())
-        f.printf("[%02d:%02d:%02d] %s\n",
+    // GPS time + uptime in ms: GPS time stands still while loop() is stalled (no NMEA
+    // parsing), the uptime shows real gaps and ordering
+    if (gpsDateOk() && instance.gps.time.isValid())   // zero time also reads as valid
+        f.printf("[%02d:%02d:%02d %8lu] %s\n",
             instance.gps.time.hour(), instance.gps.time.minute(),
-            instance.gps.time.second(), msg);
-    else f.printf("[%08lu] %s\n", millis(), msg);
+            instance.gps.time.second(), (unsigned long)millis(), msg);
+    else f.printf("[--:--:-- %8lu] %s\n", (unsigned long)millis(), msg);
     f.flush();
     f.close();
 }
 void logWritef(const char* fmt, ...) {
-    char buf[128]; va_list a; va_start(a,fmt);
+    char buf[LOG_MSG_LEN]; va_list a; va_start(a,fmt);
     vsnprintf(buf,sizeof(buf),fmt,a); va_end(a);
     logWrite(buf);
 }
+static void drainLogQueue() {
+    char item[LOG_MSG_LEN];
+    while (logQueue && xQueueReceive(logQueue, item, 0) == pdTRUE) logWrite(item);
+}
+
+// ═══════════════════════════════════════════════════════════
+// BLE dump (step 24 research): every camera notification on FFF4, every
+// command we send (except routine GPS pushes) and user MARKs go to
+// /ble_dump.txt, decoded where the format is known. Same pattern as the log:
+// any task queues, loop() writes. Set DEBUG_BLE_DUMP to 0 for a normal build.
+// ═══════════════════════════════════════════════════════════
+#if DEBUG_BLE_DUMP
+#define DUMP_PATH    "/ble_dump.txt"
+static QueueHandle_t dumpQueue = nullptr;
+
+static void dumpFrame(uint8_t dir, const uint8_t* data, size_t len) {
+    if (!dumpQueue) return;
+    DumpItem it; it.ms=millis(); it.dir=dir; it.len=(uint16_t)len;
+    memcpy(it.data, data, len<DUMP_MAX_LEN?len:DUMP_MAX_LEN);
+    xQueueSend(dumpQueue, &it, 0);
+}
+static void dumpNote(const char* text) {
+    dumpFrame(DUMP_NOTE, (const uint8_t*)text, strnlen(text, DUMP_MAX_LEN-1)+1);
+}
+
+// Status push 1D02 payload offsets (camera_status_push_command_frame, packed, 38 bytes)
+static bool dumpIsStatus(const DumpItem& it, const uint8_t** p, int* plen) {
+    if (it.dir!=DUMP_RX || it.len<18 || it.len>DUMP_MAX_LEN || it.data[0]!=0xAA) return false;
+    if ((it.data[3]&DJI_FRAME_IS_RESPONSE) || it.data[12]!=0x1D || it.data[13]!=0x02) return false;
+    *p=it.data+14; *plen=(int)it.len-18;
+    return true;
+}
+
+static bool dumpIsBattery(const DumpItem& it) {
+    return it.dir==DUMP_RX && it.len>=33 && it.len<=DUMP_MAX_LEN && it.data[0]==0x55 &&
+           it.data[9]==0x0D && it.data[10]==0x02;
+}
+
+static void dumpDecode(File& f, const DumpItem& it) {
+    const uint8_t* d=it.data;
+    if (it.len>=13 && it.len<=DUMP_MAX_LEN && d[0]==0x55) {
+        bool crcOk = duml_crc16(d,it.len-2)==(uint16_t)(d[it.len-2]|(d[it.len-1]<<8));
+        f.printf("    DUML %02X%02X seq=%u crc=%s", d[9], d[10], d[6]|(d[7]<<8), crcOk?"ok":"BAD");
+        if (dumpIsBattery(it))
+            f.printf(" BATTERY %u%% %ld mV %ld mA", d[31],
+                (long)(int32_t)(d[12]|(d[13]<<8)|(d[14]<<16)|((uint32_t)d[15]<<24)),
+                (long)(int32_t)(d[16]|(d[17]<<8)|(d[18]<<16)|((uint32_t)d[19]<<24)));
+        f.print("\n");
+        return;
+    }
+    if (it.len<18 || it.len>DUMP_MAX_LEN || d[0]!=0xAA) { f.print("    (not a full DJI frame)\n"); return; }
+    uint16_t flen=(d[1]|(d[2]<<8))&0x03FF;
+    uint8_t  type=d[3], set=d[12], id=d[13];
+    uint16_t seq=d[8]|(d[9]<<8);
+    const uint8_t* p=d+14; int plen=(int)flen-18;
+    bool crcOk = flen==it.len &&
+        dji_crc16(d,10)==(uint16_t)(d[10]|(d[11]<<8)) &&
+        dji_crc32(d,flen-4)==((uint32_t)d[flen-4]|((uint32_t)d[flen-3]<<8)|
+                              ((uint32_t)d[flen-2]<<16)|((uint32_t)d[flen-1]<<24));
+    f.printf("    %s %02X%02X seq=%u type=0x%02X len=%u crc=%s",
+        (type&DJI_FRAME_IS_RESPONSE)?"RESP":"CMD ", set, id, seq, type, flen, crcOk?"ok":"BAD");
+    if (type&DJI_FRAME_IS_RESPONSE) {
+        if (plen>0) f.printf(" ret=%u", p[0]);
+    } else if (set==0x1D && id==0x02 && plen>=38) {
+        f.printf(" STATUS mode=0x%02X status=0x%02X rec_t=%us user=%u power=%u next=0x%02X temp=%u loop=%u bat=%u%%",
+            p[0], p[1], p[5]|(p[6]<<8), p[27], p[28], p[29], p[30], p[35]|(p[36]<<8), p[37]);
+    } else if (set==0x1D && id==0x06 && plen>=2 && p[0]==0x01) {
+        int n=p[1]<plen-2?p[1]:plen-2;
+        f.print(" MODE \""); f.write(p+2,n); f.print("\"");
+    }
+    f.print("\n");
+}
+
+static void drainDump() {
+    if (!dumpQueue || uxQueueMessagesWaiting(dumpQueue)==0) return;
+    static uint8_t  lastStatus[DUMP_MAX_LEN];
+    static int      lastStatusLen = -1;
+    static uint32_t sameStatus = 0;
+    File f;
+    if (sdReady) f = SD.open(DUMP_PATH, FILE_APPEND);
+    DumpItem it;
+    while (xQueueReceive(dumpQueue, &it, 0) == pdTRUE) {
+        if (!f) continue;
+        const uint8_t* p; int plen;
+        bool status = dumpIsStatus(it, &p, &plen);
+        if (status && plen==lastStatusLen && memcmp(p,lastStatus,plen)==0) { sameStatus++; continue; }
+        if (sameStatus) { f.printf("    (+%lu identical status pushes)\n", (unsigned long)sameStatus); sameStatus=0; }
+        // Battery heartbeat (1 Hz): keep only changes of % and gaps > 3 s
+        static uint8_t  lastPct = 0xFF;
+        static uint32_t lastBattMs = 0, skippedBatt = 0;
+        if (dumpIsBattery(it)) {
+            bool keep = it.data[31]!=lastPct || it.ms-lastBattMs>3000;
+            lastPct=it.data[31]; lastBattMs=it.ms;
+            if (!keep) { skippedBatt++; continue; }
+        }
+        if (skippedBatt) { f.printf("    (+%lu battery pushes)\n", (unsigned long)skippedBatt); skippedBatt=0; }
+        if (status && plen>0 && plen<=DUMP_MAX_LEN) { memcpy(lastStatus,p,plen); lastStatusLen=plen; }
+
+        char ts[12];
+        if (gpsDateOk() && instance.gps.time.isValid())
+            snprintf(ts,sizeof(ts),"%02d:%02d:%02d",instance.gps.time.hour(),instance.gps.time.minute(),instance.gps.time.second());
+        else snprintf(ts,sizeof(ts),"--:--:--");
+        if (it.dir==DUMP_NOTE) {
+            it.data[DUMP_MAX_LEN-1]='\0';
+            f.printf("[%s %lu] ===== %s =====\n", ts, (unsigned long)it.ms, (const char*)it.data);
+            continue;
+        }
+        static const char hx[]="0123456789ABCDEF";
+        char hex[2*DUMP_MAX_LEN+1]; int n=it.len<DUMP_MAX_LEN?it.len:DUMP_MAX_LEN;
+        for (int i=0;i<n;i++){ hex[2*i]=hx[it.data[i]>>4]; hex[2*i+1]=hx[it.data[i]&15]; }
+        hex[2*n]='\0';
+        f.printf("[%s %lu] %s %u%s: %s\n", ts, (unsigned long)it.ms, it.dir==DUMP_RX?"RX":"TX",
+            it.len, it.len>DUMP_MAX_LEN?" (truncated)":"", hex);
+        dumpDecode(f, it);
+    }
+    if (f) { f.flush(); f.close(); }
+}
+#else
+static inline void dumpFrame(uint8_t, const uint8_t*, size_t) {}
+static inline void dumpNote(const char*) {}
+#endif
 
 // ═══════════════════════════════════════════════════════════
 // DJI Command: Start/Stop Recording
 // CMD_SET=0x1D, CMD_ID=0x03
 // ═══════════════════════════════════════════════════════════
-void sendRecordCommand(bool start) {
-    if (!pWriteChr || !connected) return;
+bool sendRecordCommand(bool start, uint16_t* seqOut) {
+    if (!pWriteChr || !connected) return false;
     uint8_t payload[9];
     payload[0]=DEVICE_ID&0xFF; payload[1]=(DEVICE_ID>>8)&0xFF;
     payload[2]=(DEVICE_ID>>16)&0xFF; payload[3]=(DEVICE_ID>>24)&0xFF;
     payload[4]=start?0x00:0x01;
     payload[5]=payload[6]=payload[7]=payload[8]=0x00;
     uint8_t frame[64];
-    size_t len=dji_build_frame(frame,0x1D,0x03,payload,sizeof(payload),++seqNum);
+    // Response requested (as in DJI's demo) — the reply on FFF4 carries ret_code
+    *seqOut=++seqNum;
+    size_t len=dji_build_frame(frame,0x1D,0x03,DJI_CMD_RESPONSE_OPT,payload,sizeof(payload),*seqOut);
     bool ok=pWriteChr->writeValue(frame,len,false);
-    logWritef("REC %s: %s",start?"START":"STOP",ok?"OK":"FAIL");
+    dumpFrame(DUMP_TX,frame,len);
+    if (!ok) logWritef("REC %s: write FAIL",start?"START":"STOP");
+    return ok;
+}
+
+// bleTask: send REC and wait for the camera's reply with the same SEQ.
+// Measured: START from idle ~1 s, STOP or START from pre-rec ~40 ms;
+// a sleeping camera does not answer. Returns ret_code (0 = done) or -1.
+static int recCommandWithReply(bool start, uint32_t timeoutMs) {
+    recRespNew=false;
+    uint16_t seq;
+    if (!sendRecordCommand(start,&seq)) return -1;
+    uint32_t t0=millis();
+    while (millis()-t0<timeoutMs && connected) {
+        if (recRespNew && recRespSeq==seq) {
+            int ret=recRespRet;
+            logWritef("REC %s: ret=%d (%lu ms)",start?"START":"STOP",ret,(unsigned long)(millis()-t0));
+            return ret;
+        }
+        sendGpsPayload();   // keep the 1 Hz overlay going while waiting
+        vTaskDelay(20/portTICK_PERIOD_MS);
+    }
+    logWritef("REC %s: no reply",start?"START":"STOP");
+    return -1;
+}
+
+// ═══════════════════════════════════════════════════════════
+// DJI Command: Key report — a short press of a camera button
+// CMD_SET=0x00, CMD_ID=0x11
+// ═══════════════════════════════════════════════════════════
+#define KEY_SNAPSHOT 0x03   // from sleep: record, back to sleep after STOP (wake-up adv first)
+
+static bool sendKeyReport(uint8_t key, uint16_t* seqOut) {
+    if (!pWriteChr || !connected) return false;
+    const uint8_t payload[4] = {key, 0x01, 0x00, 0x00};   // mode 1 = key event, value 0 = short press
+    uint8_t frame[32];
+    *seqOut=++seqNum;
+    size_t len=dji_build_frame(frame,0x00,0x11,DJI_CMD_RESPONSE_OPT,payload,sizeof(payload),*seqOut);
+    bool ok=pWriteChr->writeValue(frame,len,false);
+    dumpFrame(DUMP_TX,frame,len);
+    if (!ok) logWritef("Key 0x%02X: write FAIL",key);
+    return ok;
 }
 
 // ═══════════════════════════════════════════════════════════
 // DJI Command: GPS Injection
-// CMD_SET=0x00, CMD_ID=0x17, 45 bytes payload, sent at 1Hz
+// CMD_SET=0x00, CMD_ID=0x17, sent at 1Hz
+// buildGpsPayload() runs in loop() (owns instance.gps), sendGpsPayload() in bleTask.
+//
+// DJI demo layout (gps_logic.c / gps_data_push_command_frame), 48 bytes:
+//   int32 date YYYYMMDD | int32 time (hour+8)*10000+MMSS — UTC+8, hour NOT wrapped, as
+//   in the demo | int32 lon*1e7 | int32 lat*1e7 | int32 height mm | float v_north,
+//   v_east, v_down cm/s | uint32 v_acc mm, h_acc mm, speed_acc cm/s | uint32 satellites
+// Overlay in Mimo confirmed in the field (04.10.2026). Sent without a reply request: the
+// camera never answers GPS pushes. The old 45-byte layout (up to v2.1.0: UTC time, float
+// accuracies, 1-byte satellites) is gone.
 // ═══════════════════════════════════════════════════════════
-void sendGpsData() {
-    if (!pWriteChr || !connected) return;
-    if (!instance.gps.location.isValid()||!instance.gps.date.isValid()||!instance.gps.time.isValid()) return;
+void buildGpsPayload() {
+    if (!gpsFixLive()||!gpsDateOk()||!instance.gps.time.isValid()) return;
     if (instance.gps.satellites.value()==0) return;
-    uint8_t payload[45]; memset(payload,0,sizeof(payload)); uint8_t* p=payload;
     int32_t ymd=instance.gps.date.year()*10000+instance.gps.date.month()*100+instance.gps.date.day();
-    memcpy(p,&ymd,4); p+=4;
-    int32_t hms=instance.gps.time.hour()*10000+instance.gps.time.minute()*100+instance.gps.time.second();
-    memcpy(p,&hms,4); p+=4;
-    int32_t lon=(int32_t)(instance.gps.location.lng()*1e7); memcpy(p,&lon,4); p+=4;
-    int32_t lat=(int32_t)(instance.gps.location.lat()*1e7); memcpy(p,&lat,4); p+=4;
+    int32_t mmss=instance.gps.time.minute()*100+instance.gps.time.second();
+    int32_t hmsDji=(instance.gps.time.hour()+8)*10000+mmss;
+    int32_t lon=(int32_t)(instance.gps.location.lng()*1e7);
+    int32_t lat=(int32_t)(instance.gps.location.lat()*1e7);
     int32_t alt=instance.gps.altitude.isValid()?(int32_t)(instance.gps.altitude.meters()*1000.0f):0;
-    memcpy(p,&alt,4); p+=4;
     float spd=instance.gps.speed.isValid()?(float)instance.gps.speed.mps():0.0f;
     if(spd<0.5f) spd=0.0f;
     float crs=instance.gps.course.isValid()?(float)(instance.gps.course.deg()*3.14159265f/180.0f):0.0f;
     float sn=spd*cosf(crs)*100.0f, se=spd*sinf(crs)*100.0f, sd=0.0f;
-    memcpy(p,&sn,4); p+=4; memcpy(p,&se,4); p+=4; memcpy(p,&sd,4); p+=4;
-    float va=2.0f,ha=2.0f,sa=0.1f;
-    memcpy(p,&va,4); p+=4; memcpy(p,&ha,4); p+=4; memcpy(p,&sa,4); p+=4;
-    *p=(uint8_t)instance.gps.satellites.value();
+    uint32_t sats=instance.gps.satellites.value();
+
+    uint8_t dji[sizeof(gpsPayload)], *p=dji;
+    auto put=[&p](const void* v){ memcpy(p,v,4); p+=4; };
+    const uint32_t vAcc=1000, hAcc=1000, sAcc=10;   // demo defaults: 1 m, 1 m, 10 cm/s
+    put(&ymd); put(&hmsDji); put(&lon); put(&lat); put(&alt);
+    put(&sn); put(&se); put(&sd); put(&vAcc); put(&hAcc); put(&sAcc); put(&sats);
+
+    portENTER_CRITICAL(&gpsMux);
+    memcpy(gpsPayload,dji,sizeof(gpsPayload));
+    gpsPayloadReady=true;
+    portEXIT_CRITICAL(&gpsMux);
+}
+
+void sendGpsPayload() {
+    uint8_t pl[sizeof(gpsPayload)];
+    portENTER_CRITICAL(&gpsMux);
+    bool ready=gpsPayloadReady;
+    if (ready) { memcpy(pl,gpsPayload,sizeof(pl)); gpsPayloadReady=false; }
+    portEXIT_CRITICAL(&gpsMux);
+    if (!ready || !pWriteChr || !connected) return;
+    // A sleeping camera queues writes and replays them on wake-up — don't feed it
+    // (only when its heartbeat is known: never cut GPS on a camera that doesn't push it)
+    if (camHeartbeatSeen() && camAsleep()) return;
     uint8_t frame[80];
-    size_t len=dji_build_frame(frame,0x00,0x17,payload,sizeof(payload),++seqNum);
-    bool ok=pWriteChr->writeValue(frame,len,false);
-    if(!ok) logWrite("GPS inject FAIL");
+    size_t len=dji_build_frame(frame,0x00,0x17,DJI_CMD_NO_RESPONSE,pl,sizeof(pl),++seqNum);
+    if (!pWriteChr->writeValue(frame,len,false)) logWrite("GPS inject FAIL");
 }
 
 // ═══════════════════════════════════════════════════════════
@@ -294,9 +627,57 @@ void sendGpsData() {
 // IMPORTANT: FILE_WRITE ("w") truncates on esp32 core 3.x — "r+" does not.
 // SD is already mounted by instance.begin() — use SD.exists("/") to verify.
 // ═══════════════════════════════════════════════════════════
-void gpxCreateFile(const char* path) {
+// One track and one waypoint file per day: /track_YYYY_MM_DD.gpx + /track_YYYY_MM_DD_wpt.gpx.
+// Restarting the logger the same day continues the file with a new <trkseg>, so an
+// accidental stop/start no longer splits the trip into many files.
+static bool gpxDailyPaths(char* trk, size_t trkLen, char* wpt, size_t wptLen) {
+    if (!gpsDateOk()) return false;
+    int y=instance.gps.date.year(), m=instance.gps.date.month(), d=instance.gps.date.day();
+    snprintf(trk, trkLen, "/track_%04d_%02d_%02d.gpx", y, m, d);
+    snprintf(wpt, wptLen, "/track_%04d_%02d_%02d_wpt.gpx", y, m, d);
+    return true;
+}
+
+// Waypoint file: header + </gpx> on first use; waypoints are inserted before </gpx>
+static bool gpxEnsureWptFile(const char* path) {
+    File fw = SD.open(path, FILE_APPEND);
+    if (!fw) return false;
+    if (fw.size()==0) {
+        fw.print("<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n");
+        fw.print("<gpx version=\"1.1\" creator=\"TWatch-DJI\"\n");
+        fw.print("  xmlns=\"http://www.topografix.com/GPX/1/1\">\n");
+        fw.print(GPX_CLOSE);
+        fw.flush();
+    }
+    fw.close();
+    return true;
+}
+
+// Re-open an existing track for a new session: it must still end with the closing
+// tags (not cut by a power loss mid-write). Starts a new <trkseg> unless the last one
+// is still empty. false = file not usable, the caller starts a new one.
+#define TRKSEG_OPEN     "    <trkseg>\n"
+#define TRKSEG_OPEN_LEN (sizeof(TRKSEG_OPEN)-1)
+static bool gpxContinueFile(const char* path) {
+    File f = SD.open(path, "r+");
+    if (!f) return false;
+    uint32_t size = f.size();
+    char tail[TRKSEG_OPEN_LEN+FULL_CLOSE_LEN];
+    bool ok = size >= sizeof(tail) && f.seek(size-sizeof(tail)) &&
+              f.read((uint8_t*)tail, sizeof(tail)) == sizeof(tail) &&
+              memcmp(tail+TRKSEG_OPEN_LEN, TRKSEG_CLOSE GPX_CLOSE, FULL_CLOSE_LEN) == 0;
+    if (ok && memcmp(tail, TRKSEG_OPEN, TRKSEG_OPEN_LEN) != 0) {
+        f.seek(size-FULL_CLOSE_LEN);
+        f.print("    </trkseg>\n" TRKSEG_OPEN TRKSEG_CLOSE GPX_CLOSE);
+        f.flush();
+    }
+    f.close();
+    return ok;
+}
+
+bool gpxCreateFile(const char* path) {
     File f = SD.open(path, FILE_APPEND);
-    if (!f) { logWritef("GPX create FAIL: %s", path); return; }
+    if (!f) { logWritef("GPX create FAIL: %s", path); return false; }
     f.print("<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n");
     f.print("<gpx version=\"1.1\" creator=\"TWatch-DJI\"\n");
     f.print("  xmlns=\"http://www.topografix.com/GPX/1/1\"\n");
@@ -304,19 +685,24 @@ void gpxCreateFile(const char* path) {
     f.print("  xsi:schemaLocation=\"http://www.topografix.com/GPX/1/1 ");
     f.print("http://www.topografix.com/GPX/1/1/gpx.xsd\">\n");
     char header[64];
-    snprintf(header, sizeof(header), "  <trk>\n    <name>%04d-%02d-%02d</name>\n    <trkseg>\n",
-        instance.gps.date.year(), instance.gps.date.month(), instance.gps.date.day());
+    if (gpsDateOk())
+        snprintf(header, sizeof(header), "  <trk>\n    <name>%04d-%02d-%02d</name>\n" TRKSEG_OPEN,
+            instance.gps.date.year(), instance.gps.date.month(), instance.gps.date.day());
+    else
+        snprintf(header, sizeof(header), "  <trk>\n    <name>session</name>\n" TRKSEG_OPEN);
     f.print(header);
     f.print(TRKSEG_CLOSE);
     f.print(GPX_CLOSE);
     f.flush();
     f.close();
     logWritef("GPX created: %s", path);
+    return true;
 }
 
 // Write track point — "r+" + seek: open without truncation, seek to closing tags position
+// No live fix → no point (a gap is better than the last position with a new timestamp)
 void gpxWriteTrackPoint() {
-    if (!sdReady || gpxPath[0]=='\0' || !instance.gps.location.isValid()) return;
+    if (!sdReady || gpxPath[0]=='\0' || !gpsFixLive()) return;
     File f = SD.open(gpxPath, "r+");
     if (!f) { logWrite("GPX trkpt open FAIL"); return; }
     uint32_t size = f.size();
@@ -340,12 +726,22 @@ void gpxWriteTrackPoint() {
 // Write waypoint — separate *_wpt.gpx file, seek before </gpx>
 // NOTE: wpt cannot go in the main track file because the next trkpt write
 // (seek from end - FULL_CLOSE_LEN) would overwrite the wpt data.
-void gpxWriteWaypoint(const char* name) {
-    if (!sdReady || wptPath[0]=='\0' || !instance.gps.location.isValid()) return;
-    File f = SD.open(wptPath, "r+");
-    if (!f) { logWritef("GPX wpt open FAIL: %s", name); return; }
+// Logger on → this session's waypoint file. Logger off → nothing, unless anyTime
+// (BITE): then the day's waypoint file, so a mark is never lost.
+// Returns false if nothing was written (no live fix, no date, SD error).
+bool gpxWriteWaypoint(const char* name, bool anyTime) {
+    if (!sdReady || !gpsFixLive()) return false;
+    char path[sizeof(wptPath)];
+    if (wptPath[0]) {
+        strcpy(path, wptPath);
+    } else {
+        char trk[sizeof(gpxPath)];
+        if (!anyTime || !gpxDailyPaths(trk,sizeof(trk),path,sizeof(path)) || !gpxEnsureWptFile(path)) return false;
+    }
+    File f = SD.open(path, "r+");
+    if (!f) { logWritef("GPX wpt open FAIL: %s", name); return false; }
     uint32_t size = f.size();
-    if (size < GPX_CLOSE_LEN) { f.close(); return; }
+    if (size < GPX_CLOSE_LEN) { f.close(); return false; }
     f.seek(size - GPX_CLOSE_LEN);
     f.print("  <wpt lat=\""); f.print(instance.gps.location.lat(),6);
     f.print("\" lon=\""); f.print(instance.gps.location.lng(),6); f.print("\">\n");
@@ -361,128 +757,306 @@ void gpxWriteWaypoint(const char* name) {
     f.flush();
     f.close();
     logWritef("GPX wpt: %s", name);
+    return true;
 }
 
 // ═══════════════════════════════════════════════════════════
 // Recording toggle
 // ═══════════════════════════════════════════════════════════
-void toggleRecording() {
-    instance.setHapticEffects(14); instance.vibrator();
-    if (!connected || !pWriteChr) return;
-    isRecording = !isRecording;
-    sendRecordCommand(isRecording);
-    gpxWriteWaypoint(isRecording ? "REC START" : "REC STOP");
-    if (!isRecording) { delay(200); instance.setHapticEffects(14); instance.vibrator(); }
+// Built-in Montserrat has only ASCII, °, • and the LV_SYMBOL_* icons —
+// ● ■ ▶ ─ were drawn as placeholder boxes, so icons are used instead.
+void renderRec() {
     if (isRecording) {
-        lv_label_set_text(lblRec, "● REC");
+        lv_label_set_text(lblRec, LV_SYMBOL_VIDEO " REC");
         lv_obj_set_style_text_color(lblRec, lv_palette_main(LV_PALETTE_RED), 0);
     } else {
-        lv_label_set_text(lblRec, "●");
+        lv_label_set_text(lblRec, LV_SYMBOL_VIDEO);
         lv_obj_set_style_text_color(lblRec, lv_palette_darken(LV_PALETTE_GREY, 2), 0);
     }
+}
+
+void renderLog() {
+    if (gpxLogging) {
+        lv_label_set_text(lblLog, LV_SYMBOL_PLAY " LOG: ON");
+        lv_obj_set_style_text_color(lblLog, lv_palette_main(LV_PALETTE_GREEN), 0);
+    } else {
+        lv_label_set_text(lblLog, LV_SYMBOL_STOP " LOG: OFF");
+        lv_obj_set_style_text_color(lblLog, lv_palette_darken(LV_PALETTE_GREY, 2), 0);
+    }
+}
+
+// ─── Logger resume after a crash ──────────────────────────
+// RTC_NOINIT memory survives software resets (panic, watchdog, brownout) but
+// not power-off: a crashed watch continues the same track, a watch that was
+// switched off starts with the logger OFF as before.
+#define LOG_RESUME_MAGIC 0x4C4F4731UL
+static RTC_NOINIT_ATTR uint32_t rtcLogMagic;
+static RTC_NOINIT_ATTR char     rtcGpxPath[sizeof(gpxPath)];
+static RTC_NOINIT_ATTR char     rtcWptPath[sizeof(wptPath)];
+
+static void logResumeSave() {
+    if (gpxLogging) {
+        memcpy(rtcGpxPath, gpxPath, sizeof(rtcGpxPath));
+        memcpy(rtcWptPath, wptPath, sizeof(rtcWptPath));
+        rtcLogMagic = LOG_RESUME_MAGIC;
+    } else {
+        rtcLogMagic = 0;
+    }
+}
+
+static void logResumeTry() {
+    esp_reset_reason_t rr = esp_reset_reason();
+    bool crashed = rr==ESP_RST_PANIC || rr==ESP_RST_INT_WDT || rr==ESP_RST_TASK_WDT ||
+                   rr==ESP_RST_WDT   || rr==ESP_RST_BROWNOUT;
+    rtcGpxPath[sizeof(rtcGpxPath)-1] = '\0';
+    rtcWptPath[sizeof(rtcWptPath)-1] = '\0';
+    if (rtcLogMagic != LOG_RESUME_MAGIC || !crashed || !sdReady || !SD.exists(rtcGpxPath)) {
+        rtcLogMagic = 0;
+        return;
+    }
+    memcpy(gpxPath, rtcGpxPath, sizeof(gpxPath));   // keep appending to the same files
+    memcpy(wptPath, rtcWptPath, sizeof(wptPath));
+    gpxLogging = true;
+    lastTrackMs = millis();
+    renderLog();
+    logWritef("Logger RESUMED after reset (reason=%d): %s", (int)rr, gpxPath);
+}
+
+// 1 buzz = started, 2 buzzes = stopped, long buzz = camera did not confirm.
+// Soft bump right away = camera is asleep or not connected and is being woken up first.
+// The BLE work happens in bleTask; its result comes back through recDone → onRecordResult().
+void toggleRecording() {
+    if (!connected) {
+        if (wakeLinkMs) { logWrite("REC tap ignored: still waking the camera"); return; }
+        if (isRecording) {   // link lost while recording: STOP can't reach the camera
+            // Delayed: if this was the 1st tap of a "connect" double tap, the 2nd tap replaces it
+            hapticSeq(15,1,0,DOUBLE_TAP_MS);
+            logWrite("REC ignored: camera not connected");
+            return;
+        }
+        uint32_t now=millis();
+        recOnLink = true;
+        wakeLinkMs = now ? now : 1;   // bleTask: wake-up, connect, START
+        haptic(7);
+        lv_label_set_text(lblCamSat, "Cam: waking...");
+        logWrite("REC tap: start, camera not connected - waking it");
+        return;
+    }
+    if (recCmd != 0 || recDone != 0 || camWaking) {   // previous command still in flight
+        logWrite(camWaking ? "REC tap ignored: still waking the camera"
+                           : "REC tap ignored: previous command in flight");
+        return;
+    }
+    if (!isRecording && camAsleep()) {
+        haptic(7);
+        lv_label_set_text(lblCamSat, "Cam: waking...");
+    }
+    logWritef("REC tap: %s, camera %s", isRecording?"stop":"start",
+              camAwake()?"awake":camAsleep()?"asleep":"state unknown");
+    recCmd = isRecording ? -1 : +1;
+}
+
+void onRecordResult(int8_t r) {
+    if (r == REC_FAILED) { hapticError(); return; }   // state flips only on success
+    isRecording = (r > 0);
+    hapticSeq(14, isRecording?1:2, 200, 0);
+    gpxWriteWaypoint(isRecording ? "REC START" : "REC STOP", false);   // only while logging
+    renderRec();
 }
 
 // ═══════════════════════════════════════════════════════════
 // Logger toggle
 // ═══════════════════════════════════════════════════════════
 void toggleLogger() {
-    instance.setHapticEffects(14); instance.vibrator();
+    if (!gpxLogging && !sdReady) {
+        hapticError();
+        logWrite("Logger not started: no SD card");
+        return;
+    }
     gpxLogging = !gpxLogging;
     if (gpxLogging) {
-        // New file for every session
-        if (sdReady && instance.gps.date.isValid() && instance.gps.time.isValid()) {
-            snprintf(gpxPath, sizeof(gpxPath), "/track_%04d_%02d_%02d_%02d%02d.gpx",
-                instance.gps.date.year(), instance.gps.date.month(), instance.gps.date.day(),
-                instance.gps.time.hour(), instance.gps.time.minute());
-        } else {
-            trackSession++;
-            snprintf(gpxPath, sizeof(gpxPath), "/track_session_%03d.gpx", trackSession);
-        }
-        gpxCreateFile(gpxPath);
-        // Create companion wpt file (waypoints can't share main file due to seek conflict)
-        strncpy(wptPath, gpxPath, sizeof(wptPath)-1);
-        char* dot = strrchr(wptPath, '.');
-        if (dot) strcpy(dot, "_wpt.gpx");
-        if (sdReady) {
-            File fw = SD.open(wptPath, FILE_APPEND);
-            if (fw && fw.size()==0) {
-                fw.print("<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n");
-                fw.print("<gpx version=\"1.1\" creator=\"TWatch-DJI\"\n");
-                fw.print("  xmlns=\"http://www.topografix.com/GPX/1/1\">\n");
-                fw.print(GPX_CLOSE);
-                fw.flush();
+        // Day file (continued with a new segment if it already exists); without a GPS
+        // date yet — a separate session file
+        bool daily = gpxDailyPaths(gpxPath, sizeof(gpxPath), wptPath, sizeof(wptPath));
+        bool continued = daily && SD.exists(gpxPath) && gpxContinueFile(gpxPath);
+        if (!continued) {
+            if (!daily) {
+                trackSession++;
+                snprintf(gpxPath, sizeof(gpxPath), "/track_session_%03d.gpx", trackSession);
             }
-            if (fw) fw.close();
+            // Never reuse an existing file: FILE_APPEND would add a second header → invalid GPX
+            // (damaged day file, or track_session_001 again after reboot)
+            if (SD.exists(gpxPath)) {
+                char base[32];
+                strncpy(base, gpxPath, sizeof(base)-1); base[sizeof(base)-1] = '\0';
+                char* ext = strrchr(base, '.');
+                if (ext) *ext = '\0';
+                for (int n=2; n<100; n++) {
+                    snprintf(gpxPath, sizeof(gpxPath), "%s_%d.gpx", base, n);
+                    if (!SD.exists(gpxPath)) break;
+                }
+            }
+            if (!daily) {   // session file gets its own companion wpt file
+                strncpy(wptPath, gpxPath, sizeof(wptPath)-1); wptPath[sizeof(wptPath)-1] = '\0';
+                char* dot = strrchr(wptPath, '.');
+                if (dot) strcpy(dot, "_wpt.gpx");
+            }
+            if (!gpxCreateFile(gpxPath)) {
+                gpxLogging = false;
+                gpxPath[0] = wptPath[0] = '\0';
+                hapticError();
+                return;
+            }
         }
+        // Companion wpt file (waypoints can't share the track file due to the seek writes)
+        gpxEnsureWptFile(wptPath);
+        haptic(14);
         gpxWriteTrackPoint();   // первая точка сразу, не ждать 60 сек
         lastTrackMs = millis();
-        lv_label_set_text(lblLog, "▶ LOG: ON");
-        lv_obj_set_style_text_color(lblLog, lv_palette_main(LV_PALETTE_GREEN), 0);
-        logWritef("Logger START: %s", gpxPath);
+        logResumeSave();
+        renderLog();
+        logWritef("Logger START: %s%s", gpxPath, continued?" (continued, new segment)":"");
     } else {
+        haptic(14);
         wptPath[0] = '\0';
-        lv_label_set_text(lblLog, "■ LOG: OFF");
-        lv_obj_set_style_text_color(lblLog, lv_palette_darken(LV_PALETTE_GREY, 2), 0);
+        logResumeSave();
+        renderLog();
         logWrite("Logger STOP");
     }
 }
 
 // ═══════════════════════════════════════════════════════════
 // Touch zone handler
-// Upper (y < ZONE_SPLIT): tap=record, double tap=connect camera
-// Lower (y >= ZONE_SPLIT): long tap=logger, double tap=BITE waypoint
+// Upper (y < ZONE_SPLIT): tap=record, double tap=wake + connect camera (no REC)
+//                         [debug build] long press=wake-up advertising
+// Lower (y >= ZONE_SPLIT): hold 1.5 s=logger (see loop), double tap=BITE waypoint
+//                         [debug build] every single tap writes a MARK to the dump
 // ═══════════════════════════════════════════════════════════
 void handleTouchEnd(int16_t x, int16_t y, uint32_t duration) {
-    if (millis()-lastTouchMs < 250) return;
+    if (millis()-lastTouchMs < 80) return;   // 250 swallowed the 2nd tap of a fast double tap
     lastTouchMs = millis();
 
     if (y < ZONE_SPLIT) {
-        if (duration < 600) {
+#if DEBUG_BLE_DUMP
+        if (duration >= LOGGER_HOLD_MS) {
+            wakeReq = true;
+            hapticSeq(7,3,100,0);
+            logWrite("Long press: wake camera");
+            return;
+        }
+#endif
+        // Up to 1.5 s is a tap, as in the lower zone: the old 600 ms limit silently
+        // dropped slow taps (cold / wet finger, glove). Longer = sleeve, ignored.
+        if (duration >= LOGGER_HOLD_MS) {
+            logWritef("Upper press ignored: %lu ms", (unsigned long)duration);
+            return;
+        }
+        {
             static uint32_t lastTopTapMs = 0;
             static int topTapCount = 0;
-            if (millis()-lastTopTapMs < 400) topTapCount++;
+            if (millis()-duration-lastTopTapMs < DOUBLE_TAP_MS) topTapCount++;   // gap: release → next press
             else topTapCount = 1;
             lastTopTapMs = millis();
             if (topTapCount >= 2) {
                 topTapCount = 0;
                 if (!connected) {
+                    // The 1st tap asked for wake + REC; a double tap only wakes + connects
+                    recOnLink = false;
+                    if (!wakeLinkMs) { uint32_t now=millis(); wakeLinkMs = now ? now : 1; }
                     wantConnected = true;
                     triggerConnect = true;
-                    instance.setHapticEffects(7); instance.vibrator();
-                    delay(100);
-                    instance.setHapticEffects(7); instance.vibrator();
+                    hapticSeq(7,2,100,0);   // also cancels the 1st tap's pending error buzz
                     lv_label_set_text(lblCamSat, "Cam: connecting...");
-                    logWrite("Double tap: connect camera");
+                    logWrite("Double tap: wake + connect camera");
                 }
             } else {
                 toggleRecording();
             }
         }
     } else {
-        if (duration >= 600) {
-            toggleLogger();
-        } else {
+        // Logger hold (LOGGER_HOLD_MS) is handled in loop() while the finger is down;
+        // every shorter touch here is a tap, even a slow one (wet finger, glove)
+        {
             static uint32_t lastBotTapMs = 0;
             static int botTapCount = 0;
-            if (millis()-lastBotTapMs < 400) botTapCount++;
+            if (millis()-duration-lastBotTapMs < DOUBLE_TAP_MS) botTapCount++;   // gap: release → next press
             else botTapCount = 1;
             lastBotTapMs = millis();
             if (botTapCount >= 2) {
                 botTapCount = 0;
-                static int biteCount = 0;
-                biteCount++;
-                char name[16];
-                snprintf(name, sizeof(name), "BITE %d", biteCount);
-                gpxWriteWaypoint(name);
-                for (int i=0; i<3; i++) {
-                    instance.setHapticEffects(14); instance.vibrator(); delay(150);
-                }
-                logWritef("Waypoint: %s %.5f,%.5f", name,
-                    instance.gps.location.lat(), instance.gps.location.lng());
+                saveBite();
             } else {
-                instance.setHapticEffects(1); instance.vibrator();
+                haptic(1);
+#if DEBUG_BLE_DUMP
+                static int markCount = 0;
+                char mark[16];
+                snprintf(mark, sizeof(mark), "MARK %d", ++markCount);
+                dumpNote(mark);
+                logWrite(mark);
+#endif
             }
         }
+    }
+}
+
+// BITE waypoint (lower double tap or side-button double click). Logger on → this
+// session's waypoint file, logger off → the day's waypoint file. 3 buzzes = saved.
+void saveBite() {
+    static int biteCount = 0;
+    char name[16];
+    snprintf(name, sizeof(name), "BITE %d", biteCount+1);
+    if (gpxWriteWaypoint(name, true)) {
+        biteCount++;
+        hapticSeq(14,3,150,0);
+        logWritef("Waypoint: %s %.5f,%.5f%s", name,
+            instance.gps.location.lat(), instance.gps.location.lng(),
+            gpxLogging?"":" (logger off, day file)");
+    } else {
+        hapticError();
+        logWrite(!gpsFixLive() ? "BITE ignored: no GPS fix"
+               : !gpsDateOk()  ? "BITE ignored: no GPS date"
+                               : "BITE ignored: SD write error");
+    }
+}
+
+// ═══════════════════════════════════════════════════════════
+// Side button GPIO0 (lower button on the left side) — needs force, so rain and a
+// sleeve cuff can't press it, and works with a glove and with the screen dark:
+//   click        = REC start/stop (wakes a sleeping camera, like a tap)
+//   double click = BITE waypoint
+//   hold 1.5 s   = logger on/off, fires while still held
+// A click waits DOUBLE_TAP_MS for a possible second press before it acts.
+// ═══════════════════════════════════════════════════════════
+#define SIDE_BUTTON_PIN    0
+#define BUTTON_DEBOUNCE_MS 30
+
+static void serviceSideButton() {
+    static bool     raw = false, pressed = false, holdFired = false;
+    static uint32_t rawSinceMs = 0, pressMs = 0, releaseMs = 0;
+    static uint8_t  clicks = 0;   // finished short presses waiting for the double-click window
+
+    uint32_t t = millis();
+    bool now = digitalRead(SIDE_BUTTON_PIN) == LOW;
+    if (now != raw) { raw = now; rawSinceMs = t; }
+    if (raw != pressed && t - rawSinceMs >= BUTTON_DEBOUNCE_MS) {
+        pressed = raw;
+        if (pressed) { pressMs = t; holdFired = false; wakeDisplay(); }
+        else if (!holdFired) { clicks++; releaseMs = t; }
+    }
+    if (pressed && !holdFired && t - pressMs >= LOGGER_HOLD_MS) {
+        holdFired = true;
+        clicks = 0;
+        logWrite("Button: hold -> logger");
+        toggleLogger();
+    }
+    if (clicks >= 2) {
+        clicks = 0;
+        logWrite("Button: double click -> BITE");
+        saveBite();
+    } else if (clicks == 1 && !pressed && t - releaseMs >= DOUBLE_TAP_MS) {
+        clicks = 0;
+        logWrite("Button: click -> REC");
+        toggleRecording();
     }
 }
 
@@ -514,14 +1088,16 @@ const char* hdopBars() {
 // ═══════════════════════════════════════════════════════════
 void updateUI() {
     char buf[128];
-    if (instance.gps.time.isValid())
+    if (gpsDateOk() && instance.gps.time.isValid())
         snprintf(buf,sizeof(buf),"%02d:%02d UTC",
             instance.gps.time.hour(),instance.gps.time.minute());
     else snprintf(buf,sizeof(buf),"--:--");
     lv_label_set_text(lblTime,buf);
 
     if (instance.gps.location.isValid()) {
-        lv_obj_set_style_text_color(lblCoords,lv_color_white(),0);
+        // white = live fix, orange = last known position (fix lost)
+        lv_obj_set_style_text_color(lblCoords,
+            gpsFixLive()?lv_color_white():lv_palette_main(LV_PALETTE_ORANGE),0);
         snprintf(buf,sizeof(buf),"%.5f\n%.5f",
             instance.gps.location.lat(),instance.gps.location.lng());
     } else {
@@ -530,7 +1106,7 @@ void updateUI() {
     }
     lv_label_set_text(lblCoords,buf);
 
-    if (instance.gps.location.isValid()) {
+    if (gpsFixLive()) {
         float kmh=instance.gps.speed.isValid()?(float)instance.gps.speed.kmph():0.0f;
         if(kmh<2.0f) kmh=0.0f;
         snprintf(buf,sizeof(buf),"%.1f km/h   %.0f m",
@@ -538,27 +1114,225 @@ void updateUI() {
     } else snprintf(buf,sizeof(buf),"-- km/h   -- m");
     lv_label_set_text(lblSpeed,buf);
 
-    snprintf(buf,sizeof(buf),connected?"Cam: OK  GPS:%s %d":"Cam: --  GPS:%s %d",
-        hdopBars(),
+    // Cam:72% = awake (camera battery), zz = asleep / switched off, wake (yellow) = being
+    // woken for REC, OK = linked but state unknown, -- = searching, ~~ (orange) = link lost
+    bool lost = !connected && camLost;
+    char cam[8];
+    lv_color_t camColor = lv_palette_darken(LV_PALETTE_GREY,1);
+    if (connected) {
+        if (camWaking)         { strcpy(cam,"wake"); camColor=lv_palette_main(LV_PALETTE_YELLOW); }
+        else if (camAwake())   snprintf(cam,sizeof(cam),"%u%%",(unsigned)camBattPct);
+        else if (camAsleep())  { strcpy(cam,"zz"); camColor=lv_palette_main(LV_PALETTE_BLUE_GREY); }
+        else                   strcpy(cam,"OK");   // just linked, first push not in yet
+    } else if (wakeLinkMs) {   // REC / double tap at Cam:-- : waking, then connecting
+        strcpy(cam,"wake"); camColor=lv_palette_main(LV_PALETTE_YELLOW);
+    } else {
+        strcpy(cam, lost?"~~":"--");
+        if (lost) camColor=lv_palette_main(LV_PALETTE_ORANGE);
+    }
+    snprintf(buf,sizeof(buf),"Cam:%s GPS:%s %d", cam, hdopBars(),
         instance.gps.satellites.isValid()?(int)instance.gps.satellites.value():0);
+    lv_obj_set_style_text_color(lblCamSat,camColor,0);
     lv_label_set_text(lblCamSat,buf);
 
     snprintf(buf,sizeof(buf),"Bat: %d%%    SD: %s",
-        instance.pmu.getBatteryPercent(),sdReady?"OK":"--");
+        instance.pmu.getBatteryPercent(),sdReady?(DEBUG_BLE_DUMP?"DUMP":"OK"):"--");
     lv_label_set_text(lblBatSd,buf);
 }
 
 // ═══════════════════════════════════════════════════════════
 // BLE Callbacks
 // ═══════════════════════════════════════════════════════════
+// Runs in the NimBLE host task: flags only — bleTask logs and cleans up, loop() redraws
 class CameraCallbacks : public NimBLEClientCallbacks {
     void onDisconnect(NimBLEClient* c, int reason) override {
-        connected=false; isRecording=false; pWriteChr=nullptr;
-        lv_label_set_text(lblRec,"●");
-        lv_obj_set_style_text_color(lblRec,lv_palette_darken(LV_PALETTE_GREY,2),0);
-        logWritef("BLE disconnected, reason=%d",reason);
+        disconnectReason=reason;
+        connected=false;
     }
 };
+static CameraCallbacks camCallbacks;   // one instance, reused by every client (no leak per retry)
+
+// The camera's own pushes use DJI's older DUML v1 framing (SOF 0x55): CRC-16
+// init 0x3692, reflected poly 0x8408 over the whole frame minus the CRC.
+static uint16_t duml_crc16(const uint8_t* d, size_t n) {
+    uint16_t c=0x3692;
+    while (n--) { c^=*d++; for (int i=0;i<8;i++) c=(c&1)?(c>>1)^0x8408:(c>>1); }
+    return c;
+}
+
+// FFF4 notifications — NimBLE host task: validate, update flags, nothing else.
+//  • DUML 0D/02 (47 bytes, 1 Hz while awake): camera battery; byte 31 = %   → heartbeat
+//  • R SDK reply to REC / key report (AA…, CmdType bit5): payload[0] = ret_code (0 = done)
+static void onCamNotify(NimBLERemoteCharacteristic*, uint8_t* d, size_t len, bool) {
+    dumpFrame(DUMP_RX, d, len);
+    if (len<13) return;
+    size_t flen=(d[1]|(d[2]<<8))&0x03FF;
+    if (flen!=len) return;
+    if (d[0]==0x55) {
+        if (duml_crc16(d,len-2)!=(uint16_t)(d[len-2]|(d[len-1]<<8))) return;
+        if (d[9]==0x0D && d[10]==0x02 && len>=33) {
+            camBattPct=d[31];
+            // Never 0 (0 = "no push yet"), and never in the future: millis()|1 was 1 ms
+            // ahead for even values, and a check in that same ms saw a ~49-day gap → "asleep"
+            uint32_t now=millis();
+            camHeartbeatMs = now ? now : 1;
+        }
+    } else if (d[0]==0xAA && len>=19 && (d[3]&DJI_FRAME_IS_RESPONSE)) {
+        uint32_t c32=(uint32_t)d[len-4]|((uint32_t)d[len-3]<<8)|((uint32_t)d[len-2]<<16)|((uint32_t)d[len-1]<<24);
+        if (dji_crc16(d,10)!=(uint16_t)(d[10]|(d[11]<<8)) || dji_crc32(d,len-4)!=c32) return;
+        if (d[12]==0x1D && d[13]==0x03) {
+            recRespSeq=d[8]|(d[9]<<8);
+            recRespRet=d[14];
+            recRespNew=true;
+        } else if (d[12]==0x00 && d[13]==0x11) {
+            keyRespSeq=d[8]|(d[9]<<8);
+            keyRespRet=d[14];
+            keyRespNew=true;
+        }
+    }
+}
+
+// Ask the camera to push its status (1D02): mode 3 = periodic 2 Hz + once on every change
+static void subscribeCameraStatus() {
+    const uint8_t sub[6] = {3, 20, 0, 0, 0, 0};   // push_mode, push_freq (0.1 Hz units, only 20 allowed), reserved
+    uint8_t frame[32];
+    size_t len=dji_build_frame(frame,0x1D,0x05,DJI_CMD_NO_RESPONSE,sub,sizeof(sub),++seqNum);
+    bool ok=pWriteChr->writeValue(frame,len,false);
+    dumpFrame(DUMP_TX,frame,len);
+    logWritef("Status subscription: %s", ok?"sent":"FAIL");
+}
+
+// Wake-up as in DJI's demo (ble.c): advertise manufacturer data "WKP" + camera MAC
+// in reverse byte order for 2 s. Runs in bleTask.
+static void serviceWakeRequest() {
+    if (!wakeReq) return;
+    wakeReq = false;
+    wakeCamera();
+}
+static void wakeCamera() {
+    uint8_t md[9] = {'W','K','P'};
+    for (int i=0;i<6;i++) md[3+5-i]=(uint8_t)strtoul(CAMERA_MAC+3*i,nullptr,16);
+    NimBLEAdvertisementData ad;
+    ad.setManufacturerData(md,sizeof(md));
+    NimBLEAdvertising* adv=NimBLEDevice::getAdvertising();
+    adv->stop();
+    bool ok=adv->setAdvertisementData(ad) && adv->start(2000);
+    dumpNote(ok?"WAKE advertising started (2 s)":"WAKE advertising FAILED");
+    logWritef("Wake advertising: %s", ok?"started":"FAIL");
+}
+
+#if SLEEP_SNAPSHOT
+// bleTask: as DJI's remote — wake-up advertising, then the SNAPSHOT key right away (as in
+// the demo). The camera holds the one key, records once awake and goes back to sleep
+// after STOP. true = the camera confirmed (ret 0); false = confirm with wake + START.
+// Seen (fw 01.06.01.04): it records from the key but never answers it; the START that
+// follows then gets ret 0 in ~40 ms (already recording) — that is the confirmation.
+static bool snapshotFromSleep(uint32_t t0) {
+    keyRespNew=false;
+    wakeCamera();
+    uint16_t seq;
+    if (!sendKeyReport(KEY_SNAPSHOT,&seq)) return false;
+    uint32_t awakeMs=0;
+    while (connected && millis()-t0<12000) {
+        if (keyRespNew && keyRespSeq==seq) {
+            int ret=keyRespRet;
+            logWritef("Snapshot key: ret=%d (%lu ms)", ret, (unsigned long)(millis()-t0));
+            if (ret==0) return true;
+            logWrite("Snapshot key refused, falling back to START");
+            return false;
+        }
+        if (!awakeMs && camAwake()) awakeMs=millis();
+        if (awakeMs && millis()-awakeMs>2000) break;   // awake, the key got no answer
+        sendGpsPayload();   // skipped by itself until the heartbeat is back
+        vTaskDelay(20/portTICK_PERIOD_MS);
+    }
+    logWrite("Snapshot key: no reply, confirming with START");
+    return false;
+}
+#endif
+
+// bleTask: REC with up to `attempts` tries. Returns ret_code (0 = done) or -1.
+static int recWithRetries(bool start, int attempts) {
+    int ret=-1;
+    for (int attempt=0; attempt<attempts && connected; attempt++) {
+        if (attempt) vTaskDelay(700/portTICK_PERIOD_MS);
+        ret=recCommandWithReply(start, 2500);
+        if (ret==0) break;
+    }
+    return ret;
+}
+
+// bleTask: wake a sleeping camera for START (camWaking is set by the caller)
+enum { WAKE_FAILED, WAKE_AWAKE, WAKE_RECORDING };
+static int wakeForStart() {
+    uint32_t t0=millis();
+#if SLEEP_SNAPSHOT
+    if (snapshotFromSleep(t0)) return WAKE_RECORDING;
+    // Not confirmed: the classic way below (no wait if the camera is awake already)
+#else
+    wakeCamera();
+#endif
+    while (!camAwake() && millis()-t0<12000 && connected) vTaskDelay(50/portTICK_PERIOD_MS);
+    if (camAwake()) {
+        logWritef("Wake: camera awake after %lu ms", (unsigned long)(millis()-t0));
+        vTaskDelay(800/portTICK_PERIOD_MS);
+        return WAKE_AWAKE;
+    }
+    if (camHeartbeatSeen()) { logWrite("Wake: no heartbeat, giving up"); return WAKE_FAILED; }
+    logWrite("Wake: this link never had a heartbeat - sending REC anyway");   // other firmware?
+    return WAKE_AWAKE;
+}
+
+// bleTask: carry out a REC request from loop(). Returns cmd on success, REC_FAILED otherwise.
+// Never write REC to a sleeping camera: it queues the writes and replays them all on
+// wake-up (seen: START, STOP, START → not recording). Wake it, wait for the battery
+// heartbeat, then send. Right after wake-up it may still refuse (ret 223) — retry.
+// With SLEEP_SNAPSHOT the single SNAPSHOT key is sent first instead (DJI's way).
+// justWoken: the camera was woken a moment ago (by the wake-up before connecting).
+static int8_t handleRecCommand(int8_t cmd, bool justWoken) {
+    bool start = cmd>0;
+    bool woke = justWoken;
+    if (camAsleep()) {
+        if (!start) { logWrite("REC STOP: camera asleep, not recording"); return cmd; }
+        camWaking = true;
+        int w = wakeForStart();
+        if (w != WAKE_AWAKE) { camWaking=false; return w==WAKE_RECORDING ? cmd : REC_FAILED; }
+        woke = true;
+    }
+    // An awake camera answers START at once. A refusal (seen: ret 228) or silence means it
+    // is on its way to sleep: a few seconds after STOP of a SNAPSHOT recording, or during
+    // one of its ~20 s self-wakes. Don't repeat START then — a sleeping camera queues it and
+    // replays it on wake-up as a plain recording that doesn't go back to sleep. Let the
+    // camera fall asleep, then wake it the proper way.
+    int ret = recWithRetries(start, woke ? 4 : start ? 1 : 2);
+    if (ret != 0 && start && !woke && connected) {
+        camWaking = true;
+        logWrite("REC START refused: waiting for the camera to fall asleep");
+        uint32_t t0=millis();
+        while (connected && !camAsleep() && millis()-t0<15000) vTaskDelay(50/portTICK_PERIOD_MS);
+        if (camAsleep()) {
+            int w = wakeForStart();
+            ret = w==WAKE_RECORDING ? 0 : w==WAKE_AWAKE ? recWithRetries(true, 4) : -1;
+        } else logWrite("Camera stayed awake: REC START failed");
+    }
+    camWaking = false;
+    return ret==0 ? cmd : REC_FAILED;
+}
+
+// bleTask: REC asked for at Cam:-- and the link is up now. Wait until the camera's state
+// is known (battery push = awake; none for CAM_HEARTBEAT_MS = asleep), then the usual way.
+static int8_t recAfterLink() {
+    camWaking = true;
+    uint32_t t0=millis();
+    while (connected && !camAwake() && !camAsleep()) vTaskDelay(50/portTICK_PERIOD_MS);
+    bool awake = camAwake();
+    logWritef("Linked for REC: camera %s after %lu ms", awake?"awake":"asleep",
+              (unsigned long)(millis()-t0));
+    if (awake) vTaskDelay(800/portTICK_PERIOD_MS);   // just woken: let it settle (ret 223)
+    int8_t r = handleRecCommand(+1, awake);
+    camWaking = false;
+    return r;
+}
 
 // ═══════════════════════════════════════════════════════════
 // BLE Task
@@ -570,39 +1344,73 @@ void bleTask(void* pvParameters) {
     NimBLEDevice::setMTU(512);
     NimBLEAddress addr(std::string(CAMERA_MAC),BLE_ADDR_PUBLIC);
     while (true) {
-        while (!triggerConnect) vTaskDelay(200/portTICK_PERIOD_MS);
+        while (!triggerConnect) { serviceWakeRequest(); vTaskDelay(200/portTICK_PERIOD_MS); }
         triggerConnect = false;
         pClient=NimBLEDevice::createClient();
-        pClient->setClientCallbacks(new CameraCallbacks(),false);
+        pClient->setClientCallbacks(&camCallbacks,false);
         pClient->setConnectTimeout(10000);
+        // Asked for (REC or double tap at Cam:--): wake the camera first, it may be asleep
+        // and unconnectable. Advertise alone, then connect: the first version connected
+        // during the advertising (one radio) and the camera never woke (4 tries, 04.10)
+        uint32_t wl=wakeLinkMs;
+        if (wl && msSince(wl) < WAKE_LINK_MS) {
+            wakeCamera();
+            vTaskDelay(2500/portTICK_PERIOD_MS);
+        }
         logWrite("BLE connecting...");
         if (!pClient->connect(addr)) {
             logWrite("BLE connect FAIL");
             NimBLEDevice::deleteClient(pClient); pClient=nullptr;
             if (wantConnected) {
-                lv_label_set_text(lblCamSat,"Cam: searching...");
-                vTaskDelay(5000/portTICK_PERIOD_MS);
+                // 5 s between attempts; a wake request this attempt didn't serve (it came
+                // in during the attempt or the pause) cuts the pause short
+                for (int i=0; i<25 && wakeLinkMs==wl; i++) vTaskDelay(200/portTICK_PERIOD_MS);
                 triggerConnect = true;  // auto-retry
-            } else {
-                lv_label_set_text(lblCamSat,"Cam: --  GPS:.....");
             }
             continue;
         }
         auto svc=pClient->getService("0000fff0-0000-1000-8000-00805f9b34fb");
-        if (!svc){pClient->disconnect();NimBLEDevice::deleteClient(pClient);pClient=nullptr;continue;}
-        pWriteChr=svc->getCharacteristic("0000fff3-0000-1000-8000-00805f9b34fb");
-        if (!pWriteChr){pClient->disconnect();NimBLEDevice::deleteClient(pClient);pClient=nullptr;continue;}
+        pWriteChr=svc?svc->getCharacteristic("0000fff3-0000-1000-8000-00805f9b34fb"):nullptr;
+        if (!pWriteChr) {
+            logWrite(svc?"BLE FFF3 not found":"BLE FFF0 not found");
+            pClient->disconnect();NimBLEDevice::deleteClient(pClient);pClient=nullptr;
+            if (wantConnected) {
+                vTaskDelay(5000/portTICK_PERIOD_MS);
+                triggerConnect = true;  // auto-retry (was missing → reconnect stalled)
+            }
+            continue;
+        }
         auto nc=svc->getCharacteristic("0000fff4-0000-1000-8000-00805f9b34fb");
-        if (nc&&nc->canNotify())
-            nc->subscribe(true,[](NimBLERemoteCharacteristic*,uint8_t*,size_t,bool){});
+        bool notifyOk = nc && nc->canNotify() && nc->subscribe(true, onCamNotify);
+        portENTER_CRITICAL(&gpsMux); gpsPayloadReady=false; portEXIT_CRITICAL(&gpsMux);  // no stale fix
+        camHeartbeatMs=0;   // camera state unknown until its first battery push
+        camLinkMs=millis();
+        camLost=false;
         connected=true;
-        lv_obj_set_style_text_color(lblCamSat, lv_palette_darken(LV_PALETTE_GREY, 1), 0);
-        logWrite("BLE connected to camera");
-        while (connected){vTaskDelay(1000/portTICK_PERIOD_MS);sendGpsData();}
-        logWrite("BLE lost. Reconnecting in 3s...");
-        lv_label_set_text(lblCamSat, "Cam: ~~  GPS:.....");
-        lv_obj_set_style_text_color(lblCamSat, lv_palette_main(LV_PALETTE_ORANGE), 0);
+        logWritef("BLE connected to camera (FFF4 notify: %s)", notifyOk?"on":"FAIL");
+        dumpNote("BLE connected");
+        vTaskDelay(300/portTICK_PERIOD_MS);
+        subscribeCameraStatus();
+        if (wakeLinkMs) {   // the wake-up request is done; REC if it was a REC tap
+            wakeLinkMs = 0;
+            if (recOnLink) { recOnLink = false; recDone = recAfterLink(); }
+        }
+        // REC requests are picked up within ~20 ms, GPS as loop() publishes it (1 Hz).
+        // isConnected() also catches a disconnect that fired before connected=true.
+        while (connected && pClient->isConnected()) {
+            int8_t cmd=recCmd;
+            if (cmd) { recDone=handleRecCommand(cmd, false); recCmd=0; }
+            sendGpsPayload();
+            serviceWakeRequest();
+            vTaskDelay(20/portTICK_PERIOD_MS);
+        }
+        connected=false;
+        if (recCmd) { recDone=REC_FAILED; recCmd=0; }   // command raced the disconnect
+        camLost=true;
+        logWritef("BLE lost, reason=%d. Reconnecting in 3s...",disconnectReason);
+        dumpNote("BLE lost");
         pWriteChr=nullptr;
+        vTaskDelay(200/portTICK_PERIOD_MS);   // let the host task finish the disconnect event
         NimBLEDevice::deleteClient(pClient); pClient=nullptr;
         if (wantConnected) {
             vTaskDelay(3000/portTICK_PERIOD_MS);
@@ -701,10 +1509,76 @@ static void configGnssGlonass() {
 }
 
 // ═══════════════════════════════════════════════════════════
+// USB serial file access (read-only): the PC pulls logs and dumps without the
+// SD card being taken out. One command per line:
+//   ls          — files in / with sizes
+//   cat <path>  — file contents between "<<<BEGIN path size>>>" and "<<<END>>>"
+// Runs in loop(), which owns SD.
+// ═══════════════════════════════════════════════════════════
+static void serialCommand(const char* line) {
+    if (!sdReady) { Serial.println("<<<ERR no SD>>>"); return; }
+    if (strcmp(line, "ls") == 0) {
+        File root = SD.open("/");
+        Serial.println("<<<LS>>>");
+        for (File f = root.openNextFile(); f; f = root.openNextFile()) {
+            Serial.printf("%s%s %lu\n", f.name(), f.isDirectory()?"/":"", (unsigned long)f.size());
+            f.close();
+        }
+        root.close();
+        Serial.println("<<<END>>>");
+    } else if (strncmp(line, "cat ", 4) == 0) {
+        File f = SD.open(line+4, FILE_READ);
+        if (!f || f.isDirectory()) { Serial.printf("<<<ERR cannot open %s>>>\n", line+4); if (f) f.close(); return; }
+        Serial.printf("<<<BEGIN %s %lu>>>\n", line+4, (unsigned long)f.size());
+        uint8_t buf[512];
+        size_t r;
+        while ((r = f.read(buf, sizeof(buf))) > 0) Serial.write(buf, r);
+        f.close();
+        Serial.println("\n<<<END>>>");
+    }
+}
+
+static void serviceSerialCommands() {
+    static char line[64];
+    static uint8_t n = 0;
+    while (Serial.available()) {
+        int c = Serial.read();
+        if (c == '\r') continue;
+        if (c != '\n') { if (n < sizeof(line)-1) line[n++] = (char)c; continue; }
+        line[n] = '\0'; n = 0;
+        Serial.setTxTimeoutMs(100);   // a PC is reading now: wait for it, don't drop file data
+        serialCommand(line);
+        Serial.setTxTimeoutMs(0);
+    }
+}
+
+// Horizontal bar centred on screen, top edge at y
+static lv_obj_t* hLine(int y, int w, int h, lv_color_t color) {
+    lv_obj_t* o=lv_obj_create(lv_scr_act());
+    lv_obj_set_size(o,w,h);
+    lv_obj_set_style_bg_color(o,color,0);
+    lv_obj_set_style_bg_opa(o,LV_OPA_COVER,0);
+    lv_obj_set_style_border_width(o,0,0);
+    lv_obj_set_style_pad_all(o,0,0);
+    lv_obj_set_style_radius(o,0,0);
+    lv_obj_align(o,LV_ALIGN_TOP_MID,0,y);
+    return o;
+}
+
+// ═══════════════════════════════════════════════════════════
 // Setup
 // ═══════════════════════════════════════════════════════════
 void setup() {
     Serial.begin(115200);
+    // Never wait for USB: plugged into a PC with nobody reading the port, every write
+    // waited 20 × 100 ms (HWCDC host backpressure) — 4 s per log line, loop() stalled
+    // and button presses were lost. serviceSerialCommands() waits while a PC reads.
+    Serial.setTxTimeoutMs(0);
+    mainTask = xTaskGetCurrentTaskHandle();   // setup() and loop() share this task
+    logQueue = xQueueCreate(16, LOG_MSG_LEN);
+#if DEBUG_BLE_DUMP
+    dumpQueue = xQueueCreate(24, sizeof(DumpItem));
+#endif
 
     // instance.begin() initializes all hardware including SD card mount
     instance.begin();
@@ -718,6 +1592,8 @@ void setup() {
         accel.enable(25.0f, 0);
     }
 
+    pinMode(SIDE_BUTTON_PIN, INPUT_PULLUP);   // side button GPIO0, pressed = LOW
+
     // Switch GNSS to GPS + Galileo + GLONASS (BeiDou off) — see notes above configGnssGlonass()
     if (instance.getDeviceProbe() & HW_GPS_ONLINE) {
         configGnssGlonass();
@@ -727,8 +1603,14 @@ void setup() {
     // SD.exists("/") is the reliable check (proven working 2026-05-24).
     // Do NOT call installSD() again — it would try to remount and fail.
     sdReady = SD.exists("/");
-    logWrite("=== TWatch-DJI START ===");
+    logWritef("=== TWatch-DJI START (reset reason %d) ===", (int)esp_reset_reason());
     logWritef("SD: %s", sdReady?"OK":"NOT FOUND");
+#if DEBUG_BLE_DUMP
+    if (sdReady) {
+        File f = SD.open(DUMP_PATH, FILE_APPEND);
+        if (f) { f.printf("\n=== BOOT (reset reason %d) ===\n", (int)esp_reset_reason()); f.close(); }
+    }
+#endif
 
     lv_obj_set_style_bg_color(lv_scr_act(),lv_color_black(),0);
     lv_obj_set_style_bg_opa(lv_scr_act(),LV_OPA_COVER,0);
@@ -740,16 +1622,11 @@ void setup() {
     lv_obj_align(lblTime,LV_ALIGN_TOP_LEFT,70,15);
 
     lblRec=lv_label_create(lv_scr_act());
-    lv_label_set_text(lblRec,"●");
-    lv_obj_set_style_text_color(lblRec,lv_palette_darken(LV_PALETTE_GREY,2),0);
     lv_obj_set_style_text_font(lblRec,&lv_font_montserrat_28,0);
     lv_obj_align(lblRec,LV_ALIGN_TOP_RIGHT,-90,15);
+    renderRec();
 
-    lv_obj_t* l1=lv_label_create(lv_scr_act());
-    lv_label_set_text(l1,"────────────────");
-    lv_obj_set_style_text_color(l1,lv_palette_darken(LV_PALETTE_GREY,3),0);
-    lv_obj_set_style_text_font(l1,&lv_font_montserrat_14,0);
-    lv_obj_align(l1,LV_ALIGN_TOP_MID,0,55);
+    hLine(61,340,2,lv_palette_darken(LV_PALETTE_GREY,3));
 
     lblCoords=lv_label_create(lv_scr_act());
     lv_label_set_text(lblCoords,"GPS\nconnecting...");
@@ -759,11 +1636,7 @@ void setup() {
     lv_obj_set_width(lblCoords,390);
     lv_obj_align(lblCoords,LV_ALIGN_TOP_MID,0,75);
 
-    lv_obj_t* l2=lv_label_create(lv_scr_act());
-    lv_label_set_text(l2,"────────────────");
-    lv_obj_set_style_text_color(l2,lv_palette_darken(LV_PALETTE_GREY,3),0);
-    lv_obj_set_style_text_font(l2,&lv_font_montserrat_14,0);
-    lv_obj_align(l2,LV_ALIGN_TOP_MID,0,200);
+    hLine(207,340,2,lv_palette_darken(LV_PALETTE_GREY,3));
 
     lblSpeed=lv_label_create(lv_scr_act());
     lv_label_set_text(lblSpeed,"-- km/h   -- m");
@@ -781,22 +1654,14 @@ void setup() {
     lv_obj_set_width(lblCamSat,390);
     lv_obj_align(lblCamSat,LV_ALIGN_TOP_MID,0,270);
 
-    lv_obj_t* zoneLine=lv_obj_create(lv_scr_act());
-    lv_obj_set_size(zoneLine,410,3);
-    lv_obj_set_style_bg_color(zoneLine,lv_palette_main(LV_PALETTE_BLUE_GREY),0);
-    lv_obj_set_style_bg_opa(zoneLine,LV_OPA_COVER,0);
-    lv_obj_set_style_border_width(zoneLine,0,0);
-    lv_obj_set_style_pad_all(zoneLine,0,0);
-    lv_obj_set_style_radius(zoneLine,0,0);
-    lv_obj_align(zoneLine,LV_ALIGN_TOP_MID,0,318);
+    hLine(ZONE_SPLIT-1,410,3,lv_palette_main(LV_PALETTE_BLUE_GREY));   // drawn exactly at the touch boundary
 
     lblLog=lv_label_create(lv_scr_act());
-    lv_label_set_text(lblLog,"■ LOG: OFF");
-    lv_obj_set_style_text_color(lblLog,lv_palette_darken(LV_PALETTE_GREY,2),0);
     lv_obj_set_style_text_font(lblLog,&lv_font_montserrat_36,0);
     lv_obj_set_style_text_align(lblLog,LV_TEXT_ALIGN_CENTER,0);
     lv_obj_set_width(lblLog,390);
     lv_obj_align(lblLog,LV_ALIGN_TOP_MID,0,345);
+    renderLog();
 
     lblBatSd=lv_label_create(lv_scr_act());
     lv_label_set_text(lblBatSd,"Bat: --%    SD: --");
@@ -805,6 +1670,8 @@ void setup() {
     lv_obj_set_style_text_align(lblBatSd,LV_TEXT_ALIGN_CENTER,0);
     lv_obj_set_width(lblBatSd,390);
     lv_obj_align(lblBatSd,LV_ALIGN_TOP_MID,0,425);
+
+    logResumeTry();         // continue the track if we rebooted after a crash
 
     wantConnected = true;   // auto-connect on boot, retry every 5s until camera found
     triggerConnect = true;
@@ -818,9 +1685,45 @@ void loop() {
     instance.gps.loop();
     instance.loop();
 
+    serviceSerialCommands();
+
+    // ── Events from bleTask ──
+    drainLogQueue();
+#if DEBUG_BLE_DUMP
+    drainDump();
+#endif
+    int8_t rd=recDone;
+    if (rd) { recDone=0; onRecordResult(rd); }
+    if (!connected && isRecording) { isRecording=false; renderRec(); }   // link dropped
+    if (isRecording && camHeartbeatSeen() && camAsleep() && recCmd==0 && !camWaking) {
+        isRecording=false; renderRec();                                   // switched off while recording
+        logWrite("Camera asleep: REC reset");
+    }
+    uint32_t wl=wakeLinkMs;   // REC / double tap at Cam:-- that never got a link
+    if (wl && !connected && msSince(wl) >= WAKE_LINK_MS) {
+        wakeLinkMs=0;
+        if (recOnLink) { recOnLink=false; hapticError(); logWrite("Wake: camera not reached, REC cancelled"); }
+        else logWrite("Wake: camera not reached");
+    }
+    // Camera awake/asleep changes go to the log (field diagnostics)
+    static int8_t camLogged = -1;   // 0 no link, 1 awake, 2 asleep, 3 unknown (just linked)
+    int8_t cs = !connected ? 0 : camAwake() ? 1 : camAsleep() ? 2 : 3;
+    if (cs != camLogged) {
+        if (cs == 1) logWritef("Camera: awake, battery %u%%", (unsigned)camBattPct);
+        else if (cs == 2) logWrite("Camera: asleep (no battery push for 6 s)");
+        camLogged = cs;
+    }
+    if (connected && millis()-lastGpsPayloadMs>=1000) {
+        lastGpsPayloadMs=millis();
+        buildGpsPayload();
+    }
+
+    serviceHaptics();
+
     if (displayOn && millis()-lastActivityMs>DISPLAY_TIMEOUT_MS) {
         displayOn=false;
         sleepStartMs=millis();
+        accelPrimed=false;
         instance.setBrightness(0);
         logWrite("Display sleep");
     }
@@ -830,7 +1733,8 @@ void loop() {
         float mag=sqrtf(x*x+y*y+z*z);
         float delta=fabsf(mag-prevAccelMag);
         prevAccelMag=mag;
-        if (delta>2.0f) { wakeDisplay(); logWrite("Wake by shake"); }
+        if (!accelPrimed) accelPrimed=true;   // was compared against 0 / a stale value
+        else if (delta>2.0f) { wakeDisplay(); logWrite("Wake by shake"); }
     }
 
     if (!firstFix && instance.gps.location.isValid()) {
@@ -841,7 +1745,7 @@ void loop() {
             (int)instance.gps.satellites.value(),t);
     }
 
-    if (millis()-lastUiUpdate>2000) {
+    if (displayOn && millis()-lastUiUpdate>2000) {   // no redraws while the screen is dark
         lastUiUpdate=millis();
         updateUI();
     }
@@ -856,17 +1760,33 @@ void loop() {
         logWritef("Battery: %d%%",instance.pmu.getBatteryPercent());
     }
 
+    serviceSideButton();
+
     bool isTouched=instance.getTouched();
-    if (isTouched && !touchActive) {
+    // getTouched() only reports the touch IRQ flag. Right after lift-off the panel raises
+    // one more IRQ without a point; taken as a touch, it became a phantom tap with bogus
+    // coordinates (upper zone → REC after a logger hold). Only a reported point is a touch.
+    if (isTouched && !touchActive && instance.getPoint(&touchX,&touchY) > 0) {
         touchActive=true;
         touchStartMs=millis();
-        instance.getPoint(&touchX,&touchY);
+        touchWasOn=displayOn;
+        touchHoldFired=false;
+    }
+    // Logger hold in the lower zone fires while the finger is still down, so its buzz
+    // says "done, let go"; the release of that touch is then ignored
+    if (isTouched && touchActive && touchWasOn && !touchHoldFired &&
+        touchY>=ZONE_SPLIT && millis()-touchStartMs>=LOGGER_HOLD_MS) {
+        touchHoldFired=true;
+        toggleLogger();
     }
     if (!isTouched && touchActive) {
         touchActive=false;
         uint32_t dur=millis()-touchStartMs;
+        bool wasOn=displayOn;
         wakeDisplay();
-        if (displayOn) handleTouchEnd(touchX,touchY,dur);
+        if (wasOn && !touchHoldFired) handleTouchEnd(touchX,touchY,dur);   // tap on dark screen only wakes it
+        else if (touchHoldFired) lastTouchMs=millis();   // the 80 ms debounce also follows a hold
+        else logWrite("Tap on dark screen: display woken, no action");
     }
 
     lv_task_handler();
