@@ -32,6 +32,26 @@ and a dump of the camera's notifications.
 - **BITE is never lost** — With the logger off, BITE goes to the day's waypoint file.
 - **Logger resume after a crash** — RTC memory keeps the track across panic,
   watchdog and brownout resets (not power-off); the reset reason is logged at boot.
+- **Side button control** — The lower left button (GPIO0): click = REC, double
+  click = BITE, hold 1.5 s = logger; works with the screen dark. Field logs of
+  26.08 (rain, a tight sleeve cuff over the watch) showed 377 REC commands, 29
+  bursts of 6+ in two minutes, from false touches on the wet screen. The touch
+  zones stay as they were.
+- **Recording from sleep, the DJI-remote way** — Wake-up advertising plus a
+  SNAPSHOT key report (`0x00/0x11`, key `0x03`): the camera records and goes back
+  to sleep by itself ~10–13 s after STOP (after a plain START it stayed on for
+  minutes). It does not answer the key (fw 01.06.01.04), so a following START
+  confirms it (`ret 0` in ~40 ms = already recording). `SLEEP_SNAPSHOT 0` brings
+  back the plain wake + START.
+- **REC at `Cam:--`** — A camera that fell asleep while the link was down (watch
+  reboot, out of range) accepts no connection until it is woken (seen: 7 minutes
+  of failed connects). A REC press now sends the wake-up advertising, connects and
+  starts recording (~10 s), or gives a long buzz after 60 s. The advertising has to
+  go out alone: overlapped with a connect attempt it never woke the camera. A
+  double tap at `Cam:--` wakes and connects without recording.
+- **Field diagnostics in the log** — uptime in ms next to the GPS time, camera
+  awake/asleep changes with its battery, every REC press and every ignored tap
+  with the reason.
 - **Read-only SD access over USB serial** — `ls`, `cat <path>`.
 - **BLE debug dump** — `DEBUG_BLE_DUMP` (off by default) writes every FFF4
   notification and sent command to `/ble_dump.txt`, decoded where known.
@@ -39,12 +59,20 @@ and a dump of the camera's notifications.
 ### Changed
 
 - **GPS injection uses DJI's 48-byte layout** (uint32 accuracies, uint32
-  satellites, time as UTC+8) from the official demo; the old 45-byte layout stays
-  behind `GPS_FRAME_LEGACY`. On every connection both layouts are sent once with a
-  reply request and the camera's answers are logged. *Not field-verified yet.*
+  satellites, time as UTC+8) from the official demo — confirmed in the field (the
+  overlay shows in DJI Mimo) and byte-for-byte equal to the real frames in the
+  demo's `test/test_gps.c`. The camera never answers GPS pushes, so they go
+  without a reply request; the old 45-byte layout is removed.
 - **Logger toggle = hold 1.5 s** (was a 0.6 s long tap), firing while the finger is
   still down. Field logs showed slow taps / a wet screen toggling the logger, which
   split trips into 12–15 files a day and lost 3 of 6 BITE marks.
+- **Upper-zone tap up to 1.5 s** (was 0.6 s): slow taps with a cold or wet finger
+  were silently dropped. Longer presses (a sleeve) are ignored and logged.
+- **A refused START is not repeated** — An awake camera answers START at once; a
+  refusal (`ret 228`, seen a few seconds after STOP of a SNAPSHOT recording, while
+  the camera goes back to sleep) or silence means it is falling asleep. A repeated
+  START would be queued by the sleeping camera and replayed on wake-up as a plain
+  recording, so the watch waits for the camera to sleep and wakes it properly.
 - **Touch zones** split exactly at the drawn line (y = 318); icons replace glyphs
   missing from the font (`●■▶─` were drawn as boxes).
 - **Non-blocking haptics** — no `delay()` in touch handlers.
@@ -66,7 +94,15 @@ and a dump of the camera's notifications.
   file; the closing-tag length was off by one (29 → 30).
 - **Stale GPS position** — `location.isValid()` stays true after the fix is lost;
   a fix now also needs `age() < 3 s`.
-- **Zero GPS date** accepted as valid (`log_2000_00_00.txt`, `track_2000_00_00_*.gpx`).
+- **Zero GPS date** accepted as valid (`log_2000_00_00.txt`, `track_2000_00_00_*.gpx`);
+  a zero GPS time was logged as `00:00:00`.
+- **False "Camera asleep: REC reset" 1–4 s after REC** — the heartbeat stamp
+  `millis()|1` could be 1 ms in the future and the unsigned age wrapped to ~49
+  days. Time differences are signed now (`msSince()`).
+- **Watch stalled on a PC's USB port** — with nobody reading the port, every log
+  line waited ~4 s for USB (HWCDC backpressure, 20 × 100 ms): presses were lost and
+  REC was shown late. Serial output never blocks now, except while serving
+  `ls` / `cat`.
 - **BLE** — no retry after a failed service discovery; a `CameraCallbacks` object
   leaked on every connection attempt.
 - **False confirmations** — "recording started" buzz without a camera, "BITE saved"
@@ -76,6 +112,9 @@ and a dump of the camera's notifications.
 
 - Recording started with the camera's own button is not seen by the watch: status
   push `1D02` does not arrive without the `0x00/0x19` connection handshake.
+- A recording started by waking the camera from `Cam:--` is a plain recording:
+  the camera stays on after STOP.
+- The camera sometimes wakes by itself for ~20 s after going to sleep (harmless).
 - After a USB upload the watch may take up to ~3 minutes to start.
 - Field battery life is ~8 h (BLE + GPS + screen), not the estimated ~10 h.
 

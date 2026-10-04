@@ -12,16 +12,21 @@ DJI Mimo, and logs GPX tracks to SD card.
 - **Real camera state** — `Cam:72%` (awake, camera battery), `Cam:zz` (switched
   off but still linked over BLE), `Cam:wake`, `Cam:~~` (link lost).
 - **Confirmed recording** — REC lights up only after the camera confirms.
-- **Wake-on-REC** — A tap wakes a sleeping camera and starts recording (~3 s).
+- **Wake-on-REC, the DJI-remote way** — One press wakes a sleeping camera and
+  starts recording (~4–5 s); after STOP the camera goes back to sleep by itself.
+  Works even after the link was lost while the camera slept (~10 s).
+- **Side button** — The lower left button records (click), marks BITE (double
+  click) and toggles the logger (hold 1.5 s). Rain and a sleeve cuff caused
+  hundreds of false REC taps on the touch screen; the button needs a real press.
 - **One GPX track per day** — A new segment per logger session; BITE marks are
   saved even with the logger off.
 - **Logger = hold 1.5 s** — No more accidental toggles from slow taps or a wet
   screen.
 - **Stability** — Thread-safety rework, phantom-tap and dark-screen-tap fixes,
-  logger resume after a crash, no more log flood from GPS writes to a sleeping
-  camera.
-- **GPS injection in DJI's 48-byte layout** — From DJI's official demo; not
-  field-verified yet (the old layout is one `#define` away).
+  no false REC resets, no stalls on a PC's USB port, logger resume after a crash,
+  no more log flood from GPS writes to a sleeping camera.
+- **GPS injection in DJI's 48-byte layout** — From DJI's official demo;
+  confirmed in the field (overlay in DJI Mimo).
 - **Logs over USB** — `ls` / `cat <path>` on the serial port, no need to remove
   the SD card.
 

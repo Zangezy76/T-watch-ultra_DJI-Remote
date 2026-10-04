@@ -96,13 +96,21 @@ static bool          isRecording    = false;
 static uint16_t      seqNum         = 0;
 static volatile bool triggerConnect = false;
 static volatile bool wakeReq        = false;   // loop() → bleTask: send wake-up advertising
+// REC while not connected. A camera that fell asleep without a link (watch reboot, out of
+// range) takes no connection until it is woken — seen twice: 7 min of "BLE connect FAIL"
+// until it was switched on by hand. loop() sets wakeLinkMs on the tap; bleTask sends the
+// wake-up before every connect attempt while it is set (WAKE_LINK_MS at most) and, if
+// recOnLink, starts recording once linked. A double tap wakes + connects without REC.
+#define WAKE_LINK_MS 60000
+static volatile uint32_t wakeLinkMs = 0;   // millis() of the request, 0 = none
+static volatile bool     recOnLink  = false;
 
 // Camera awake/asleep. The camera keeps the BLE link while switched off, so
 // "connected" alone means nothing. While awake it pushes its battery state once
 // a second (DUML 0D/02, see onCamNotify); silence = asleep. A 3 s gap was seen
 // while awake, hence 6 s. If no push was ever seen on this link (other firmware?)
 // the state is unknown and the watch behaves as before.
-#define CAM_HEARTBEAT_MS 6000UL
+#define CAM_HEARTBEAT_MS 6000   // signed on purpose, see msSince()
 static volatile uint32_t camHeartbeatMs = 0;   // millis() of the last battery push, 0 = none yet
 static volatile uint32_t camLinkMs      = 0;   // millis() when the current link came up
 static volatile uint8_t  camBattPct     = 0;
@@ -112,6 +120,10 @@ static volatile bool     camWaking      = false;   // bleTask is waking the came
 static volatile bool     recRespNew = false;
 static volatile uint16_t recRespSeq = 0;
 static volatile uint8_t  recRespRet = 0;
+// Key report reply handoff (0x00/0x11): onCamNotify → bleTask
+static volatile bool     keyRespNew = false;
+static volatile uint16_t keyRespSeq = 0;
+static volatile uint8_t  keyRespRet = 0;
 
 // BLE dump for step 24 research (see "BLE dump" below). Declared up here because
 // Arduino inserts its generated function prototypes before the first function.
@@ -122,21 +134,17 @@ struct DumpItem { uint32_t ms; uint8_t dir; uint16_t len; uint8_t data[DUMP_MAX_
 
 // REC command handoff: loop() → bleTask → loop()
 #define REC_FAILED 2
+// REC on a sleeping camera. 1 = as DJI's own remote: wake-up advertising + SNAPSHOT key
+// (0x00/0x11, key 0x03) — the camera records and goes back to sleep after STOP.
+// 0 = wake, wait for the heartbeat, then 1D03 START (the camera stays on after STOP).
+#define SLEEP_SNAPSHOT 1
 static volatile int8_t recCmd  = 0;   // +1 start, -1 stop; set by loop(), cleared by bleTask
 static volatile int8_t recDone = 0;   // +1/-1 sent OK, REC_FAILED; set by bleTask, cleared by loop()
 
 // GPS injection handoff: loop() snapshots instance.gps, bleTask sends it.
-// Two layouts of the same data, see buildGpsPayload(); GPS_FRAME_LEGACY picks the one in use.
-#define GPS_FRAME_LEGACY 0
 static portMUX_TYPE  gpsMux = portMUX_INITIALIZER_UNLOCKED;
-static uint8_t       gpsPayload[48];         // DJI demo layout
-static uint8_t       gpsPayloadLegacy[45];   // our layout up to v20
+static uint8_t       gpsPayload[48];         // DJI demo layout, see buildGpsPayload()
 static volatile bool gpsPayloadReady = false;
-// Camera's opinion of each layout: both are sent with a reply request once per link
-static volatile bool     gpsProbePending = false;   // set by bleTask on connect
-static volatile bool     gpsReplyNew = false;       // onCamNotify → bleTask
-static volatile uint16_t gpsReplySeq = 0;
-static volatile uint8_t  gpsReplyRet = 0;
 static uint32_t      lastGpsPayloadMs = 0;
 
 static uint32_t lastUiUpdate = 0;
@@ -264,11 +272,14 @@ size_t dji_build_frame(uint8_t* buf, uint8_t cmd_set, uint8_t cmd_id, uint8_t cm
 // Camera state from the battery heartbeat (see CAM_HEARTBEAT_MS). A link with no
 // push for CAM_HEARTBEAT_MS since it came up = connected to an already sleeping camera.
 static bool camHeartbeatSeen() { return camHeartbeatMs != 0; }
-static bool camAwake()  { uint32_t t=camHeartbeatMs; return t && millis()-t < CAM_HEARTBEAT_MS; }
+// The stamp is written by the NimBLE host task on the other core: compare signed, so a
+// stamp that is momentarily newer than this core's millis() reads as "just now".
+static int32_t msSince(uint32_t t) { return (int32_t)(millis()-t); }
+static bool camAwake()  { uint32_t t=camHeartbeatMs; return t && msSince(t) < CAM_HEARTBEAT_MS; }
 static bool camAsleep() {
     uint32_t t=camHeartbeatMs;
-    if (t) return millis()-t >= CAM_HEARTBEAT_MS;
-    return connected && millis()-camLinkMs >= CAM_HEARTBEAT_MS;
+    if (t) return msSince(t) >= CAM_HEARTBEAT_MS;
+    return connected && msSince(camLinkMs) >= CAM_HEARTBEAT_MS;
 }
 
 // ═══════════════════════════════════════════════════════════
@@ -353,11 +364,13 @@ void logWrite(const char* msg) {
     if (logPath[0] == '\0') snprintf(logPath, sizeof(logPath), "/log_nodate.txt");
     File f = SD.open(logPath, FILE_APPEND);
     if (!f) return;
-    if (instance.gps.time.isValid())
-        f.printf("[%02d:%02d:%02d] %s\n",
+    // GPS time + uptime in ms: GPS time stands still while loop() is stalled (no NMEA
+    // parsing), the uptime shows real gaps and ordering
+    if (gpsDateOk() && instance.gps.time.isValid())   // zero time also reads as valid
+        f.printf("[%02d:%02d:%02d %8lu] %s\n",
             instance.gps.time.hour(), instance.gps.time.minute(),
-            instance.gps.time.second(), msg);
-    else f.printf("[%08lu] %s\n", millis(), msg);
+            instance.gps.time.second(), (unsigned long)millis(), msg);
+    else f.printf("[--:--:-- %8lu] %s\n", (unsigned long)millis(), msg);
     f.flush();
     f.close();
 }
@@ -465,7 +478,7 @@ static void drainDump() {
         if (status && plen>0 && plen<=DUMP_MAX_LEN) { memcpy(lastStatus,p,plen); lastStatusLen=plen; }
 
         char ts[12];
-        if (instance.gps.time.isValid())
+        if (gpsDateOk() && instance.gps.time.isValid())
             snprintf(ts,sizeof(ts),"%02d:%02d:%02d",instance.gps.time.hour(),instance.gps.time.minute(),instance.gps.time.second());
         else snprintf(ts,sizeof(ts),"--:--:--");
         if (it.dir==DUMP_NOTE) {
@@ -531,6 +544,24 @@ static int recCommandWithReply(bool start, uint32_t timeoutMs) {
 }
 
 // ═══════════════════════════════════════════════════════════
+// DJI Command: Key report — a short press of a camera button
+// CMD_SET=0x00, CMD_ID=0x11
+// ═══════════════════════════════════════════════════════════
+#define KEY_SNAPSHOT 0x03   // from sleep: record, back to sleep after STOP (wake-up adv first)
+
+static bool sendKeyReport(uint8_t key, uint16_t* seqOut) {
+    if (!pWriteChr || !connected) return false;
+    const uint8_t payload[4] = {key, 0x01, 0x00, 0x00};   // mode 1 = key event, value 0 = short press
+    uint8_t frame[32];
+    *seqOut=++seqNum;
+    size_t len=dji_build_frame(frame,0x00,0x11,DJI_CMD_RESPONSE_OPT,payload,sizeof(payload),*seqOut);
+    bool ok=pWriteChr->writeValue(frame,len,false);
+    dumpFrame(DUMP_TX,frame,len);
+    if (!ok) logWritef("Key 0x%02X: write FAIL",key);
+    return ok;
+}
+
+// ═══════════════════════════════════════════════════════════
 // DJI Command: GPS Injection
 // CMD_SET=0x00, CMD_ID=0x17, sent at 1Hz
 // buildGpsPayload() runs in loop() (owns instance.gps), sendGpsPayload() in bleTask.
@@ -539,15 +570,15 @@ static int recCommandWithReply(bool start, uint32_t timeoutMs) {
 //   int32 date YYYYMMDD | int32 time (hour+8)*10000+MMSS — UTC+8, hour NOT wrapped, as
 //   in the demo | int32 lon*1e7 | int32 lat*1e7 | int32 height mm | float v_north,
 //   v_east, v_down cm/s | uint32 v_acc mm, h_acc mm, speed_acc cm/s | uint32 satellites
-// Legacy layout (up to v20), 45 bytes: UTC time, accuracies as floats (2.0f reads as
-// 1073741824 mm), satellites as one byte. The overlay in Mimo worked with it too.
+// Overlay in Mimo confirmed in the field (04.10.2026). Sent without a reply request: the
+// camera never answers GPS pushes. The old 45-byte layout (up to v2.1.0: UTC time, float
+// accuracies, 1-byte satellites) is gone.
 // ═══════════════════════════════════════════════════════════
 void buildGpsPayload() {
     if (!gpsFixLive()||!gpsDateOk()||!instance.gps.time.isValid()) return;
     if (instance.gps.satellites.value()==0) return;
     int32_t ymd=instance.gps.date.year()*10000+instance.gps.date.month()*100+instance.gps.date.day();
     int32_t mmss=instance.gps.time.minute()*100+instance.gps.time.second();
-    int32_t hmsUtc=instance.gps.time.hour()*10000+mmss;
     int32_t hmsDji=(instance.gps.time.hour()+8)*10000+mmss;
     int32_t lon=(int32_t)(instance.gps.location.lng()*1e7);
     int32_t lat=(int32_t)(instance.gps.location.lat()*1e7);
@@ -564,72 +595,25 @@ void buildGpsPayload() {
     put(&ymd); put(&hmsDji); put(&lon); put(&lat); put(&alt);
     put(&sn); put(&se); put(&sd); put(&vAcc); put(&hAcc); put(&sAcc); put(&sats);
 
-    uint8_t old[sizeof(gpsPayloadLegacy)];
-    p=old;
-    const float va=2.0f, ha=2.0f, sa=0.1f;
-    put(&ymd); put(&hmsUtc); put(&lon); put(&lat); put(&alt);
-    put(&sn); put(&se); put(&sd); put(&va); put(&ha); put(&sa);
-    *p=(uint8_t)sats;
-
     portENTER_CRITICAL(&gpsMux);
     memcpy(gpsPayload,dji,sizeof(gpsPayload));
-    memcpy(gpsPayloadLegacy,old,sizeof(gpsPayloadLegacy));
     gpsPayloadReady=true;
     portEXIT_CRITICAL(&gpsMux);
 }
 
-// bleTask only: SEQs of the last reply-requesting push of each layout, and how many
-// replies of this link to log in full (later ones only when ret != 0)
-static uint16_t gpsProbeSeqDji = 0, gpsProbeSeqLegacy = 0;
-static uint8_t  gpsVerboseReplies = 0;
-
-static void sendGpsFrame(const uint8_t* pl, size_t n, bool reply, uint16_t* seqOut) {
-    uint8_t frame[80];
-    uint16_t seq=++seqNum;
-    size_t len=dji_build_frame(frame,0x00,0x17,reply?DJI_CMD_RESPONSE_OPT:DJI_CMD_NO_RESPONSE,pl,n,seq);
-    bool ok=pWriteChr->writeValue(frame,len,false);
-    if (reply) { dumpFrame(DUMP_TX,frame,len); *seqOut=seq; }
-    if (!ok) logWrite("GPS inject FAIL");
-}
-
 void sendGpsPayload() {
-    uint8_t dji[sizeof(gpsPayload)], old[sizeof(gpsPayloadLegacy)];
+    uint8_t pl[sizeof(gpsPayload)];
     portENTER_CRITICAL(&gpsMux);
     bool ready=gpsPayloadReady;
-    if (ready) {
-        memcpy(dji,gpsPayload,sizeof(dji));
-        memcpy(old,gpsPayloadLegacy,sizeof(old));
-        gpsPayloadReady=false;
-    }
+    if (ready) { memcpy(pl,gpsPayload,sizeof(pl)); gpsPayloadReady=false; }
     portEXIT_CRITICAL(&gpsMux);
     if (!ready || !pWriteChr || !connected) return;
     // A sleeping camera queues writes and replays them on wake-up — don't feed it
     // (only when its heartbeat is known: never cut GPS on a camera that doesn't push it)
     if (camHeartbeatSeen() && camAsleep()) return;
-    const bool legacy = GPS_FRAME_LEGACY;
-    static uint32_t count=0;
-    bool probe = (++count%60==0);   // the layout in use asks for a reply now and then
-    if (gpsProbePending) {
-        // Once per link: the other layout first, then the one in use, both with a reply,
-        // so the camera ends up with the layout in use
-        gpsProbePending=false;
-        probe=true;
-        if (legacy) sendGpsFrame(dji,sizeof(dji),true,&gpsProbeSeqDji);
-        else        sendGpsFrame(old,sizeof(old),true,&gpsProbeSeqLegacy);
-    }
-    if (legacy) sendGpsFrame(old,sizeof(old),probe,&gpsProbeSeqLegacy);
-    else        sendGpsFrame(dji,sizeof(dji),probe,&gpsProbeSeqDji);
-}
-
-// bleTask: log the camera's replies to GPS pushes (ret 0 = accepted)
-static void serviceGpsReplies() {
-    if (!gpsReplyNew) return;
-    gpsReplyNew=false;
-    uint16_t seq=gpsReplySeq;
-    uint8_t  ret=gpsReplyRet;
-    if (gpsVerboseReplies==0 && ret==0) return;
-    if (gpsVerboseReplies) gpsVerboseReplies--;
-    logWritef("GPS reply (%s): ret=%u", seq==gpsProbeSeqDji?"DJI 48 B":seq==gpsProbeSeqLegacy?"legacy 45 B":"?", ret);
+    uint8_t frame[80];
+    size_t len=dji_build_frame(frame,0x00,0x17,DJI_CMD_NO_RESPONSE,pl,sizeof(pl),++seqNum);
+    if (!pWriteChr->writeValue(frame,len,false)) logWrite("GPS inject FAIL");
 }
 
 // ═══════════════════════════════════════════════════════════
@@ -839,20 +823,36 @@ static void logResumeTry() {
 }
 
 // 1 buzz = started, 2 buzzes = stopped, long buzz = camera did not confirm.
-// Soft bump right away = camera is asleep and is being woken up first.
+// Soft bump right away = camera is asleep or not connected and is being woken up first.
 // The BLE work happens in bleTask; its result comes back through recDone → onRecordResult().
 void toggleRecording() {
     if (!connected) {
-        // Delayed: if this was the 1st tap of a "connect" double tap, the 2nd tap replaces it
-        hapticSeq(15,1,0,DOUBLE_TAP_MS);
-        logWrite("REC ignored: camera not connected");
+        if (wakeLinkMs) { logWrite("REC tap ignored: still waking the camera"); return; }
+        if (isRecording) {   // link lost while recording: STOP can't reach the camera
+            // Delayed: if this was the 1st tap of a "connect" double tap, the 2nd tap replaces it
+            hapticSeq(15,1,0,DOUBLE_TAP_MS);
+            logWrite("REC ignored: camera not connected");
+            return;
+        }
+        uint32_t now=millis();
+        recOnLink = true;
+        wakeLinkMs = now ? now : 1;   // bleTask: wake-up, connect, START
+        haptic(7);
+        lv_label_set_text(lblCamSat, "Cam: waking...");
+        logWrite("REC tap: start, camera not connected - waking it");
         return;
     }
-    if (recCmd != 0 || recDone != 0) return;   // previous command still in flight
+    if (recCmd != 0 || recDone != 0 || camWaking) {   // previous command still in flight
+        logWrite(camWaking ? "REC tap ignored: still waking the camera"
+                           : "REC tap ignored: previous command in flight");
+        return;
+    }
     if (!isRecording && camAsleep()) {
         haptic(7);
         lv_label_set_text(lblCamSat, "Cam: waking...");
     }
+    logWritef("REC tap: %s, camera %s", isRecording?"stop":"start",
+              camAwake()?"awake":camAsleep()?"asleep":"state unknown");
     recCmd = isRecording ? -1 : +1;
 }
 
@@ -927,7 +927,7 @@ void toggleLogger() {
 
 // ═══════════════════════════════════════════════════════════
 // Touch zone handler
-// Upper (y < ZONE_SPLIT): tap=record, double tap=connect camera
+// Upper (y < ZONE_SPLIT): tap=record, double tap=wake + connect camera (no REC)
 //                         [debug build] long press=wake-up advertising
 // Lower (y >= ZONE_SPLIT): hold 1.5 s=logger (see loop), double tap=BITE waypoint
 //                         [debug build] every single tap writes a MARK to the dump
@@ -938,14 +938,20 @@ void handleTouchEnd(int16_t x, int16_t y, uint32_t duration) {
 
     if (y < ZONE_SPLIT) {
 #if DEBUG_BLE_DUMP
-        if (duration >= 600) {
+        if (duration >= LOGGER_HOLD_MS) {
             wakeReq = true;
             hapticSeq(7,3,100,0);
             logWrite("Long press: wake camera");
             return;
         }
 #endif
-        if (duration < 600) {
+        // Up to 1.5 s is a tap, as in the lower zone: the old 600 ms limit silently
+        // dropped slow taps (cold / wet finger, glove). Longer = sleeve, ignored.
+        if (duration >= LOGGER_HOLD_MS) {
+            logWritef("Upper press ignored: %lu ms", (unsigned long)duration);
+            return;
+        }
+        {
             static uint32_t lastTopTapMs = 0;
             static int topTapCount = 0;
             if (millis()-duration-lastTopTapMs < DOUBLE_TAP_MS) topTapCount++;   // gap: release → next press
@@ -954,11 +960,14 @@ void handleTouchEnd(int16_t x, int16_t y, uint32_t duration) {
             if (topTapCount >= 2) {
                 topTapCount = 0;
                 if (!connected) {
+                    // The 1st tap asked for wake + REC; a double tap only wakes + connects
+                    recOnLink = false;
+                    if (!wakeLinkMs) { uint32_t now=millis(); wakeLinkMs = now ? now : 1; }
                     wantConnected = true;
                     triggerConnect = true;
                     hapticSeq(7,2,100,0);   // also cancels the 1st tap's pending error buzz
                     lv_label_set_text(lblCamSat, "Cam: connecting...");
-                    logWrite("Double tap: connect camera");
+                    logWrite("Double tap: wake + connect camera");
                 }
             } else {
                 toggleRecording();
@@ -975,21 +984,7 @@ void handleTouchEnd(int16_t x, int16_t y, uint32_t duration) {
             lastBotTapMs = millis();
             if (botTapCount >= 2) {
                 botTapCount = 0;
-                static int biteCount = 0;
-                char name[16];
-                snprintf(name, sizeof(name), "BITE %d", biteCount+1);
-                if (gpxWriteWaypoint(name, true)) {   // logger off → day's waypoint file
-                    biteCount++;
-                    hapticSeq(14,3,150,0);
-                    logWritef("Waypoint: %s %.5f,%.5f%s", name,
-                        instance.gps.location.lat(), instance.gps.location.lng(),
-                        gpxLogging?"":" (logger off, day file)");
-                } else {
-                    hapticError();
-                    logWrite(!gpsFixLive() ? "BITE ignored: no GPS fix"
-                           : !gpsDateOk()  ? "BITE ignored: no GPS date"
-                                           : "BITE ignored: SD write error");
-                }
+                saveBite();
             } else {
                 haptic(1);
 #if DEBUG_BLE_DUMP
@@ -1001,6 +996,67 @@ void handleTouchEnd(int16_t x, int16_t y, uint32_t duration) {
 #endif
             }
         }
+    }
+}
+
+// BITE waypoint (lower double tap or side-button double click). Logger on → this
+// session's waypoint file, logger off → the day's waypoint file. 3 buzzes = saved.
+void saveBite() {
+    static int biteCount = 0;
+    char name[16];
+    snprintf(name, sizeof(name), "BITE %d", biteCount+1);
+    if (gpxWriteWaypoint(name, true)) {
+        biteCount++;
+        hapticSeq(14,3,150,0);
+        logWritef("Waypoint: %s %.5f,%.5f%s", name,
+            instance.gps.location.lat(), instance.gps.location.lng(),
+            gpxLogging?"":" (logger off, day file)");
+    } else {
+        hapticError();
+        logWrite(!gpsFixLive() ? "BITE ignored: no GPS fix"
+               : !gpsDateOk()  ? "BITE ignored: no GPS date"
+                               : "BITE ignored: SD write error");
+    }
+}
+
+// ═══════════════════════════════════════════════════════════
+// Side button GPIO0 (lower button on the left side) — needs force, so rain and a
+// sleeve cuff can't press it, and works with a glove and with the screen dark:
+//   click        = REC start/stop (wakes a sleeping camera, like a tap)
+//   double click = BITE waypoint
+//   hold 1.5 s   = logger on/off, fires while still held
+// A click waits DOUBLE_TAP_MS for a possible second press before it acts.
+// ═══════════════════════════════════════════════════════════
+#define SIDE_BUTTON_PIN    0
+#define BUTTON_DEBOUNCE_MS 30
+
+static void serviceSideButton() {
+    static bool     raw = false, pressed = false, holdFired = false;
+    static uint32_t rawSinceMs = 0, pressMs = 0, releaseMs = 0;
+    static uint8_t  clicks = 0;   // finished short presses waiting for the double-click window
+
+    uint32_t t = millis();
+    bool now = digitalRead(SIDE_BUTTON_PIN) == LOW;
+    if (now != raw) { raw = now; rawSinceMs = t; }
+    if (raw != pressed && t - rawSinceMs >= BUTTON_DEBOUNCE_MS) {
+        pressed = raw;
+        if (pressed) { pressMs = t; holdFired = false; wakeDisplay(); }
+        else if (!holdFired) { clicks++; releaseMs = t; }
+    }
+    if (pressed && !holdFired && t - pressMs >= LOGGER_HOLD_MS) {
+        holdFired = true;
+        clicks = 0;
+        logWrite("Button: hold -> logger");
+        toggleLogger();
+    }
+    if (clicks >= 2) {
+        clicks = 0;
+        logWrite("Button: double click -> BITE");
+        saveBite();
+    } else if (clicks == 1 && !pressed && t - releaseMs >= DOUBLE_TAP_MS) {
+        clicks = 0;
+        logWrite("Button: click -> REC");
+        toggleRecording();
     }
 }
 
@@ -1032,7 +1088,7 @@ const char* hdopBars() {
 // ═══════════════════════════════════════════════════════════
 void updateUI() {
     char buf[128];
-    if (instance.gps.time.isValid())
+    if (gpsDateOk() && instance.gps.time.isValid())
         snprintf(buf,sizeof(buf),"%02d:%02d UTC",
             instance.gps.time.hour(),instance.gps.time.minute());
     else snprintf(buf,sizeof(buf),"--:--");
@@ -1068,6 +1124,8 @@ void updateUI() {
         else if (camAwake())   snprintf(cam,sizeof(cam),"%u%%",(unsigned)camBattPct);
         else if (camAsleep())  { strcpy(cam,"zz"); camColor=lv_palette_main(LV_PALETTE_BLUE_GREY); }
         else                   strcpy(cam,"OK");   // just linked, first push not in yet
+    } else if (wakeLinkMs) {   // REC / double tap at Cam:-- : waking, then connecting
+        strcpy(cam,"wake"); camColor=lv_palette_main(LV_PALETTE_YELLOW);
     } else {
         strcpy(cam, lost?"~~":"--");
         if (lost) camColor=lv_palette_main(LV_PALETTE_ORANGE);
@@ -1104,7 +1162,7 @@ static uint16_t duml_crc16(const uint8_t* d, size_t n) {
 
 // FFF4 notifications — NimBLE host task: validate, update flags, nothing else.
 //  • DUML 0D/02 (47 bytes, 1 Hz while awake): camera battery; byte 31 = %   → heartbeat
-//  • R SDK reply to REC (AA…, CmdType bit5): payload[0] = ret_code (0 = done)
+//  • R SDK reply to REC / key report (AA…, CmdType bit5): payload[0] = ret_code (0 = done)
 static void onCamNotify(NimBLERemoteCharacteristic*, uint8_t* d, size_t len, bool) {
     dumpFrame(DUMP_RX, d, len);
     if (len<13) return;
@@ -1114,7 +1172,10 @@ static void onCamNotify(NimBLERemoteCharacteristic*, uint8_t* d, size_t len, boo
         if (duml_crc16(d,len-2)!=(uint16_t)(d[len-2]|(d[len-1]<<8))) return;
         if (d[9]==0x0D && d[10]==0x02 && len>=33) {
             camBattPct=d[31];
-            camHeartbeatMs=millis()|1;   // never 0 (0 = "no push yet")
+            // Never 0 (0 = "no push yet"), and never in the future: millis()|1 was 1 ms
+            // ahead for even values, and a check in that same ms saw a ~49-day gap → "asleep"
+            uint32_t now=millis();
+            camHeartbeatMs = now ? now : 1;
         }
     } else if (d[0]==0xAA && len>=19 && (d[3]&DJI_FRAME_IS_RESPONSE)) {
         uint32_t c32=(uint32_t)d[len-4]|((uint32_t)d[len-3]<<8)|((uint32_t)d[len-2]<<16)|((uint32_t)d[len-1]<<24);
@@ -1123,10 +1184,10 @@ static void onCamNotify(NimBLERemoteCharacteristic*, uint8_t* d, size_t len, boo
             recRespSeq=d[8]|(d[9]<<8);
             recRespRet=d[14];
             recRespNew=true;
-        } else if (d[12]==0x00 && d[13]==0x17) {
-            gpsReplySeq=d[8]|(d[9]<<8);
-            gpsReplyRet=d[14];
-            gpsReplyNew=true;
+        } else if (d[12]==0x00 && d[13]==0x11) {
+            keyRespSeq=d[8]|(d[9]<<8);
+            keyRespRet=d[14];
+            keyRespNew=true;
         }
     }
 }
@@ -1160,37 +1221,117 @@ static void wakeCamera() {
     logWritef("Wake advertising: %s", ok?"started":"FAIL");
 }
 
+#if SLEEP_SNAPSHOT
+// bleTask: as DJI's remote — wake-up advertising, then the SNAPSHOT key right away (as in
+// the demo). The camera holds the one key, records once awake and goes back to sleep
+// after STOP. true = the camera confirmed (ret 0); false = confirm with wake + START.
+// Seen (fw 01.06.01.04): it records from the key but never answers it; the START that
+// follows then gets ret 0 in ~40 ms (already recording) — that is the confirmation.
+static bool snapshotFromSleep(uint32_t t0) {
+    keyRespNew=false;
+    wakeCamera();
+    uint16_t seq;
+    if (!sendKeyReport(KEY_SNAPSHOT,&seq)) return false;
+    uint32_t awakeMs=0;
+    while (connected && millis()-t0<12000) {
+        if (keyRespNew && keyRespSeq==seq) {
+            int ret=keyRespRet;
+            logWritef("Snapshot key: ret=%d (%lu ms)", ret, (unsigned long)(millis()-t0));
+            if (ret==0) return true;
+            logWrite("Snapshot key refused, falling back to START");
+            return false;
+        }
+        if (!awakeMs && camAwake()) awakeMs=millis();
+        if (awakeMs && millis()-awakeMs>2000) break;   // awake, the key got no answer
+        sendGpsPayload();   // skipped by itself until the heartbeat is back
+        vTaskDelay(20/portTICK_PERIOD_MS);
+    }
+    logWrite("Snapshot key: no reply, confirming with START");
+    return false;
+}
+#endif
+
+// bleTask: REC with up to `attempts` tries. Returns ret_code (0 = done) or -1.
+static int recWithRetries(bool start, int attempts) {
+    int ret=-1;
+    for (int attempt=0; attempt<attempts && connected; attempt++) {
+        if (attempt) vTaskDelay(700/portTICK_PERIOD_MS);
+        ret=recCommandWithReply(start, 2500);
+        if (ret==0) break;
+    }
+    return ret;
+}
+
+// bleTask: wake a sleeping camera for START (camWaking is set by the caller)
+enum { WAKE_FAILED, WAKE_AWAKE, WAKE_RECORDING };
+static int wakeForStart() {
+    uint32_t t0=millis();
+#if SLEEP_SNAPSHOT
+    if (snapshotFromSleep(t0)) return WAKE_RECORDING;
+    // Not confirmed: the classic way below (no wait if the camera is awake already)
+#else
+    wakeCamera();
+#endif
+    while (!camAwake() && millis()-t0<12000 && connected) vTaskDelay(50/portTICK_PERIOD_MS);
+    if (camAwake()) {
+        logWritef("Wake: camera awake after %lu ms", (unsigned long)(millis()-t0));
+        vTaskDelay(800/portTICK_PERIOD_MS);
+        return WAKE_AWAKE;
+    }
+    if (camHeartbeatSeen()) { logWrite("Wake: no heartbeat, giving up"); return WAKE_FAILED; }
+    logWrite("Wake: this link never had a heartbeat - sending REC anyway");   // other firmware?
+    return WAKE_AWAKE;
+}
+
 // bleTask: carry out a REC request from loop(). Returns cmd on success, REC_FAILED otherwise.
 // Never write REC to a sleeping camera: it queues the writes and replays them all on
 // wake-up (seen: START, STOP, START → not recording). Wake it, wait for the battery
 // heartbeat, then send. Right after wake-up it may still refuse (ret 223) — retry.
-static int8_t handleRecCommand(int8_t cmd) {
+// With SLEEP_SNAPSHOT the single SNAPSHOT key is sent first instead (DJI's way).
+// justWoken: the camera was woken a moment ago (by the wake-up before connecting).
+static int8_t handleRecCommand(int8_t cmd, bool justWoken) {
     bool start = cmd>0;
-    bool woke = false;
+    bool woke = justWoken;
     if (camAsleep()) {
         if (!start) { logWrite("REC STOP: camera asleep, not recording"); return cmd; }
         camWaking = true;
-        uint32_t t0=millis();
-        wakeCamera();
-        while (!camAwake() && millis()-t0<12000 && connected) vTaskDelay(50/portTICK_PERIOD_MS);
-        if (camAwake()) {
-            logWritef("Wake: camera awake after %lu ms", (unsigned long)(millis()-t0));
-            woke = true;
-            vTaskDelay(800/portTICK_PERIOD_MS);
-        } else if (camHeartbeatSeen()) {
-            camWaking=false; logWrite("Wake: no heartbeat, giving up"); return REC_FAILED;
-        } else {
-            logWrite("Wake: this link never had a heartbeat - sending REC anyway");   // other firmware?
-        }
+        int w = wakeForStart();
+        if (w != WAKE_AWAKE) { camWaking=false; return w==WAKE_RECORDING ? cmd : REC_FAILED; }
+        woke = true;
     }
-    int ret=-1;
-    for (int attempt=0; attempt<(woke?4:2) && connected; attempt++) {
-        ret=recCommandWithReply(start, 2500);
-        if (ret==0) break;
-        vTaskDelay(700/portTICK_PERIOD_MS);
+    // An awake camera answers START at once. A refusal (seen: ret 228) or silence means it
+    // is on its way to sleep: a few seconds after STOP of a SNAPSHOT recording, or during
+    // one of its ~20 s self-wakes. Don't repeat START then — a sleeping camera queues it and
+    // replays it on wake-up as a plain recording that doesn't go back to sleep. Let the
+    // camera fall asleep, then wake it the proper way.
+    int ret = recWithRetries(start, woke ? 4 : start ? 1 : 2);
+    if (ret != 0 && start && !woke && connected) {
+        camWaking = true;
+        logWrite("REC START refused: waiting for the camera to fall asleep");
+        uint32_t t0=millis();
+        while (connected && !camAsleep() && millis()-t0<15000) vTaskDelay(50/portTICK_PERIOD_MS);
+        if (camAsleep()) {
+            int w = wakeForStart();
+            ret = w==WAKE_RECORDING ? 0 : w==WAKE_AWAKE ? recWithRetries(true, 4) : -1;
+        } else logWrite("Camera stayed awake: REC START failed");
     }
     camWaking = false;
     return ret==0 ? cmd : REC_FAILED;
+}
+
+// bleTask: REC asked for at Cam:-- and the link is up now. Wait until the camera's state
+// is known (battery push = awake; none for CAM_HEARTBEAT_MS = asleep), then the usual way.
+static int8_t recAfterLink() {
+    camWaking = true;
+    uint32_t t0=millis();
+    while (connected && !camAwake() && !camAsleep()) vTaskDelay(50/portTICK_PERIOD_MS);
+    bool awake = camAwake();
+    logWritef("Linked for REC: camera %s after %lu ms", awake?"awake":"asleep",
+              (unsigned long)(millis()-t0));
+    if (awake) vTaskDelay(800/portTICK_PERIOD_MS);   // just woken: let it settle (ret 223)
+    int8_t r = handleRecCommand(+1, awake);
+    camWaking = false;
+    return r;
 }
 
 // ═══════════════════════════════════════════════════════════
@@ -1208,12 +1349,22 @@ void bleTask(void* pvParameters) {
         pClient=NimBLEDevice::createClient();
         pClient->setClientCallbacks(&camCallbacks,false);
         pClient->setConnectTimeout(10000);
+        // Asked for (REC or double tap at Cam:--): wake the camera first, it may be asleep
+        // and unconnectable. Advertise alone, then connect: the first version connected
+        // during the advertising (one radio) and the camera never woke (4 tries, 04.10)
+        uint32_t wl=wakeLinkMs;
+        if (wl && msSince(wl) < WAKE_LINK_MS) {
+            wakeCamera();
+            vTaskDelay(2500/portTICK_PERIOD_MS);
+        }
         logWrite("BLE connecting...");
         if (!pClient->connect(addr)) {
             logWrite("BLE connect FAIL");
             NimBLEDevice::deleteClient(pClient); pClient=nullptr;
             if (wantConnected) {
-                vTaskDelay(5000/portTICK_PERIOD_MS);
+                // 5 s between attempts; a wake request this attempt didn't serve (it came
+                // in during the attempt or the pause) cuts the pause short
+                for (int i=0; i<25 && wakeLinkMs==wl; i++) vTaskDelay(200/portTICK_PERIOD_MS);
                 triggerConnect = true;  // auto-retry
             }
             continue;
@@ -1232,8 +1383,6 @@ void bleTask(void* pvParameters) {
         auto nc=svc->getCharacteristic("0000fff4-0000-1000-8000-00805f9b34fb");
         bool notifyOk = nc && nc->canNotify() && nc->subscribe(true, onCamNotify);
         portENTER_CRITICAL(&gpsMux); gpsPayloadReady=false; portEXIT_CRITICAL(&gpsMux);  // no stale fix
-        gpsProbePending=true;   // first GPS push of this link asks about both layouts
-        gpsVerboseReplies=2;
         camHeartbeatMs=0;   // camera state unknown until its first battery push
         camLinkMs=millis();
         camLost=false;
@@ -1242,13 +1391,16 @@ void bleTask(void* pvParameters) {
         dumpNote("BLE connected");
         vTaskDelay(300/portTICK_PERIOD_MS);
         subscribeCameraStatus();
+        if (wakeLinkMs) {   // the wake-up request is done; REC if it was a REC tap
+            wakeLinkMs = 0;
+            if (recOnLink) { recOnLink = false; recDone = recAfterLink(); }
+        }
         // REC requests are picked up within ~20 ms, GPS as loop() publishes it (1 Hz).
         // isConnected() also catches a disconnect that fired before connected=true.
         while (connected && pClient->isConnected()) {
             int8_t cmd=recCmd;
-            if (cmd) { recDone=handleRecCommand(cmd); recCmd=0; }
+            if (cmd) { recDone=handleRecCommand(cmd, false); recCmd=0; }
             sendGpsPayload();
-            serviceGpsReplies();
             serviceWakeRequest();
             vTaskDelay(20/portTICK_PERIOD_MS);
         }
@@ -1363,6 +1515,29 @@ static void configGnssGlonass() {
 //   cat <path>  — file contents between "<<<BEGIN path size>>>" and "<<<END>>>"
 // Runs in loop(), which owns SD.
 // ═══════════════════════════════════════════════════════════
+static void serialCommand(const char* line) {
+    if (!sdReady) { Serial.println("<<<ERR no SD>>>"); return; }
+    if (strcmp(line, "ls") == 0) {
+        File root = SD.open("/");
+        Serial.println("<<<LS>>>");
+        for (File f = root.openNextFile(); f; f = root.openNextFile()) {
+            Serial.printf("%s%s %lu\n", f.name(), f.isDirectory()?"/":"", (unsigned long)f.size());
+            f.close();
+        }
+        root.close();
+        Serial.println("<<<END>>>");
+    } else if (strncmp(line, "cat ", 4) == 0) {
+        File f = SD.open(line+4, FILE_READ);
+        if (!f || f.isDirectory()) { Serial.printf("<<<ERR cannot open %s>>>\n", line+4); if (f) f.close(); return; }
+        Serial.printf("<<<BEGIN %s %lu>>>\n", line+4, (unsigned long)f.size());
+        uint8_t buf[512];
+        size_t r;
+        while ((r = f.read(buf, sizeof(buf))) > 0) Serial.write(buf, r);
+        f.close();
+        Serial.println("\n<<<END>>>");
+    }
+}
+
 static void serviceSerialCommands() {
     static char line[64];
     static uint8_t n = 0;
@@ -1371,26 +1546,9 @@ static void serviceSerialCommands() {
         if (c == '\r') continue;
         if (c != '\n') { if (n < sizeof(line)-1) line[n++] = (char)c; continue; }
         line[n] = '\0'; n = 0;
-        if (!sdReady) { Serial.println("<<<ERR no SD>>>"); continue; }
-        if (strcmp(line, "ls") == 0) {
-            File root = SD.open("/");
-            Serial.println("<<<LS>>>");
-            for (File f = root.openNextFile(); f; f = root.openNextFile()) {
-                Serial.printf("%s%s %lu\n", f.name(), f.isDirectory()?"/":"", (unsigned long)f.size());
-                f.close();
-            }
-            root.close();
-            Serial.println("<<<END>>>");
-        } else if (strncmp(line, "cat ", 4) == 0) {
-            File f = SD.open(line+4, FILE_READ);
-            if (!f || f.isDirectory()) { Serial.printf("<<<ERR cannot open %s>>>\n", line+4); if (f) f.close(); continue; }
-            Serial.printf("<<<BEGIN %s %lu>>>\n", line+4, (unsigned long)f.size());
-            uint8_t buf[512];
-            size_t r;
-            while ((r = f.read(buf, sizeof(buf))) > 0) Serial.write(buf, r);
-            f.close();
-            Serial.println("\n<<<END>>>");
-        }
+        Serial.setTxTimeoutMs(100);   // a PC is reading now: wait for it, don't drop file data
+        serialCommand(line);
+        Serial.setTxTimeoutMs(0);
     }
 }
 
@@ -1412,6 +1570,10 @@ static lv_obj_t* hLine(int y, int w, int h, lv_color_t color) {
 // ═══════════════════════════════════════════════════════════
 void setup() {
     Serial.begin(115200);
+    // Never wait for USB: plugged into a PC with nobody reading the port, every write
+    // waited 20 × 100 ms (HWCDC host backpressure) — 4 s per log line, loop() stalled
+    // and button presses were lost. serviceSerialCommands() waits while a PC reads.
+    Serial.setTxTimeoutMs(0);
     mainTask = xTaskGetCurrentTaskHandle();   // setup() and loop() share this task
     logQueue = xQueueCreate(16, LOG_MSG_LEN);
 #if DEBUG_BLE_DUMP
@@ -1429,6 +1591,8 @@ void setup() {
     if (instance.getDeviceProbe() & HW_BHI260AP_ONLINE) {
         accel.enable(25.0f, 0);
     }
+
+    pinMode(SIDE_BUTTON_PIN, INPUT_PULLUP);   // side button GPIO0, pressed = LOW
 
     // Switch GNSS to GPS + Galileo + GLONASS (BeiDou off) — see notes above configGnssGlonass()
     if (instance.getDeviceProbe() & HW_GPS_ONLINE) {
@@ -1535,6 +1699,20 @@ void loop() {
         isRecording=false; renderRec();                                   // switched off while recording
         logWrite("Camera asleep: REC reset");
     }
+    uint32_t wl=wakeLinkMs;   // REC / double tap at Cam:-- that never got a link
+    if (wl && !connected && msSince(wl) >= WAKE_LINK_MS) {
+        wakeLinkMs=0;
+        if (recOnLink) { recOnLink=false; hapticError(); logWrite("Wake: camera not reached, REC cancelled"); }
+        else logWrite("Wake: camera not reached");
+    }
+    // Camera awake/asleep changes go to the log (field diagnostics)
+    static int8_t camLogged = -1;   // 0 no link, 1 awake, 2 asleep, 3 unknown (just linked)
+    int8_t cs = !connected ? 0 : camAwake() ? 1 : camAsleep() ? 2 : 3;
+    if (cs != camLogged) {
+        if (cs == 1) logWritef("Camera: awake, battery %u%%", (unsigned)camBattPct);
+        else if (cs == 2) logWrite("Camera: asleep (no battery push for 6 s)");
+        camLogged = cs;
+    }
     if (connected && millis()-lastGpsPayloadMs>=1000) {
         lastGpsPayloadMs=millis();
         buildGpsPayload();
@@ -1582,6 +1760,8 @@ void loop() {
         logWritef("Battery: %d%%",instance.pmu.getBatteryPercent());
     }
 
+    serviceSideButton();
+
     bool isTouched=instance.getTouched();
     // getTouched() only reports the touch IRQ flag. Right after lift-off the panel raises
     // one more IRQ without a point; taken as a touch, it became a phantom tap with bogus
@@ -1606,6 +1786,7 @@ void loop() {
         wakeDisplay();
         if (wasOn && !touchHoldFired) handleTouchEnd(touchX,touchY,dur);   // tap on dark screen only wakes it
         else if (touchHoldFired) lastTouchMs=millis();   // the 80 ms debounce also follows a hold
+        else logWrite("Tap on dark screen: display woken, no action");
     }
 
     lv_task_handler();

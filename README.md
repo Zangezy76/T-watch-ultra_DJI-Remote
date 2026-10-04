@@ -7,9 +7,10 @@ A custom BLE remote control for DJI Osmo Action 5 Pro built on LILYGO T-Watch Ul
 ## ✨ Features
 
 - **BLE Camera Control** — Start/stop recording with a tap; REC lights up only after the camera confirms the command
-- **Wake a Sleeping Camera** — The camera keeps BLE alive when switched off; a tap wakes it and starts recording
+- **Wake a Sleeping Camera** — The camera keeps BLE alive when switched off; one press wakes it and starts recording, and — as with DJI's own remote — it goes back to sleep after STOP. Works even after the link was lost while the camera slept
+- **Side Button** — The lower left button records, marks BITE and toggles the logger: rain and a sleeve cuff can't press it, and it works with the screen dark
 - **Camera State on the Watch** — Awake / asleep / link lost, plus the camera's own battery level
-- **GPS Injection** — Real-time coordinates sent to camera every second, GPS overlay confirmed working in DJI Mimo
+- **GPS Injection** — Real-time coordinates sent to camera every second in DJI's 48-byte layout, GPS overlay confirmed working in DJI Mimo
 - **GPX Logger** — One track per day (a new segment for each session) with waypoints (REC START/STOP, fishing spots); BITE marks are saved even when the logger is off
 - **Display Sleep** — Auto-off after 1 minute, wake by wrist shake
 - **Two Touch Zones** — Upper zone = camera control, lower zone = logger and waypoints
@@ -39,7 +40,7 @@ A custom BLE remote control for DJI Osmo Action 5 Pro built on LILYGO T-Watch Ul
 ┌─────────────────────────┐
 │  08:42 UTC   [cam] REC  │
 │                         │  ← TAP = start/stop recording
-│    55.79567             │    DOUBLE TAP = connect camera
+│    55.79567             │    DOUBLE TAP = wake + connect camera
 │    37.80550             │
 │  5.4 km/h   230 m       │
 │  Cam:72% GPS:||||. 8    │
@@ -51,14 +52,20 @@ A custom BLE remote control for DJI Osmo Action 5 Pro built on LILYGO T-Watch Ul
 
 | Action | Zone | Result |
 |--------|------|--------|
-| Tap | Upper | Start / Stop recording (after the camera confirms) |
-| Tap while `Cam:zz` | Upper | Wake the camera and start recording (~3 s) |
-| Double tap | Upper | Connect to camera |
+| Tap (up to 1.5 s) | Upper | Start / Stop recording (after the camera confirms); longer presses (a sleeve) are ignored |
+| Tap while `Cam:zz` | Upper | Wake the camera and record (~4–5 s); after STOP the camera goes back to sleep |
+| Tap while `Cam:--` | Upper | Wake the camera, connect and record (~10 s); long buzz if it is not found within 60 s |
+| Double tap | Upper | Wake + connect the camera, no recording |
 | Hold 1.5 s | Lower | Start / Stop GPX logger — buzzes while you hold, then let go |
 | Double tap | Lower | Save waypoint "BITE N" (even with the logger off) |
 | Tap on a dark screen / wrist shake | — | Wake display only |
+| Click | Side button (lower left) | Same as an upper tap; fires ~0.4 s after release (waits for a second click) |
+| Double click | Side button | Save waypoint "BITE N" |
+| Hold 1.5 s | Side button | Start / Stop GPX logger |
 
-**Camera status line:** `Cam:72%` awake (camera battery) · `Cam:zz` switched off / asleep, BLE link still up · `Cam:wake` being woken for REC · `Cam:--` searching · `Cam:~~` link lost, reconnecting.
+The side button works with the screen dark (it wakes it too). Holding it while the watch powers up or resets enters the download mode.
+
+**Camera status line:** `Cam:72%` awake (camera battery) · `Cam:zz` switched off / asleep, BLE link still up · `Cam:wake` being woken for REC · `Cam:--` searching (a camera that fell asleep without a link is found only after a wake-up — press REC) · `Cam:~~` link lost, reconnecting.
 
 **Vibration:** 1 = recording started / logger toggled · 2 = recording stopped · 3 = BITE saved · soft bump = waking the camera · long buzz = not done (camera did not confirm / not connected; for BITE — no GPS fix, date or SD).
 
@@ -77,11 +84,12 @@ Reverse-engineered from the original [DJI-Remote](https://github.com/nicholaswil
 |---------|---------|--------|-------|
 | Start recording | 0x1D | 0x03 | device_id + 0x00; reply `ret_code` (0 = done) |
 | Stop recording | 0x1D | 0x03 | device_id + 0x01 |
-| GPS injection | 0x00 | 0x17 | 48-byte layout from DJI's demo (time as UTC+8) |
+| GPS injection | 0x00 | 0x17 | 48-byte layout from DJI's demo (time as UTC+8); confirmed in Mimo; the camera never replies |
+| Key report | 0x00 | 0x11 | key (1 record, 2 QS, 3 SNAPSHOT) + 0x01 + 0x0000 = short press. SNAPSHOT from sleep: the camera records and goes back to sleep after STOP; no reply |
 | Switch mode | 0x1D | 0x04 | Video/Photo/Night/etc |
 | Status subscription | 0x1D | 0x05 | push_mode=3, push_freq=20 — accepted, but status 1D02 does not arrive without the 0x00/0x19 handshake |
 | Battery push (from camera) | 0x0D | 0x02 | DUML frame (SOF 0x55), 1 Hz while the camera is awake — used as a heartbeat; byte 31 = battery % |
-| Wake-up | — | — | BLE advertising: manufacturer data `WKP` + camera MAC reversed, 2 s |
+| Wake-up | — | — | BLE advertising: manufacturer data `WKP` + camera MAC reversed, 2 s — on its own, not during a connect attempt |
 
 - **CmdType:** 0x00 no reply, 0x01 reply requested, 0x02 reply mandatory; bit 5 marks a reply frame. A reply carries the same SEQ, payload[0] = `ret_code`.
 - **CRC16:** table-driven CRC-16 (0xA001 table, as CRC-16/ARC), init=0x3AA3, over bytes 0–9
@@ -195,6 +203,8 @@ DJI-Remote/
 - **BLE:** All BLE operations in a FreeRTOS task — calling `connect()` from `setup()` hangs the system
 - **Threads:** LVGL, SD and `instance.gps` only from `loop()`; camera writes only from the BLE task; other tasks log through a queue
 - **Camera power:** the Osmo Action 5 Pro keeps the BLE link when switched off, so "connected" ≠ "on". Its 1 Hz battery push is the awake signal. A sleeping camera queues writes and replays them all on wake-up — never send it commands; wake it first
+- **Wake without a link:** a camera that fell asleep while the link was down accepts no connection until it is woken — advertise `WKP` alone, then connect
+- **USB serial:** plugged into a PC with nobody reading the port, every `Serial` write blocks up to 2 s (HWCDC backpressure) — `Serial.setTxTimeoutMs(0)` keeps `loop()` running
 - **Write vs. done:** a BLE write without response only means "sent"; request a reply (CmdType 0x01) to know the camera executed it
 - **Touch:** `getTouched()` only reports the IRQ flag; right after lift-off the panel raises one more IRQ without a point — count a touch only when `getPoint()` returns a point
 - **Fonts:** the built-in Montserrat has only ASCII, `°`, `•` and `LV_SYMBOL_*` icons — other glyphs render as boxes
@@ -206,7 +216,7 @@ DJI-Remote/
 
 This project started as a fork of [DJI-Remote](https://github.com/nicholaswilde/DJI-Remote) (ESP-IDF). The protocol was reverse-engineered from that codebase. The Arduino/LilyGoLib port was built from scratch to run on the T-Watch Ultra wristwatch.
 
-Use case: fishing from a boat — camera mounted on the boat, watch on wrist. One tap starts recording, GPS coordinates are overlaid on the video in DJI Mimo, and the route is logged as a GPX track.
+Use case: fishing from a boat — camera mounted on the boat, watch on wrist. One press starts recording, GPS coordinates are overlaid on the video in DJI Mimo, and the route is logged as a GPX track.
 
 ---
 
