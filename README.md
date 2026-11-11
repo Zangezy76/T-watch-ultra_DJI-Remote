@@ -163,9 +163,9 @@ its closing tags, and GPX 1.1 requires `<wpt>` before `<trk>`.
 
 1. Open `arduino/DJI_Remote_T-Watch/DJI_Remote_T-Watch.ino` in Arduino IDE
 2. Select board: **LILYGO T-Watch Ultra (SX1262)**
-3. Set your camera MAC address in the sketch:
+3. Set your camera MAC address in the sketch (the build stops with an error until you do):
 ```cpp
-static const char* CAMERA_MAC = "xx:xx:xx:xx:xx:xx";
+#define CAMERA_MAC_ADDR "AA:BB:CC:DD:EE:FF"
 ```
 4. Upload via COM port (auto-detected, no button press needed)
 

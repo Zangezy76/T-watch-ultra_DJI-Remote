@@ -30,8 +30,23 @@
 // ─── Camera BLE address and device ID ─────────────────────
 // Set your camera's BLE MAC address here
 // Find it in DJI Mimo → Camera Settings → About
-static const char* CAMERA_MAC   = "xx:xx:xx:xx:xx:xx";  // <-- set your DJI camera BLE MAC
+// (a build can also pass it as -DCAMERA_MAC_ADDR=\"AA:BB:CC:DD:EE:FF\")
+#ifndef CAMERA_MAC_ADDR
+#define CAMERA_MAC_ADDR "xx:xx:xx:xx:xx:xx"   // <-- set your DJI camera BLE MAC
+#endif
+static const char* CAMERA_MAC   = CAMERA_MAC_ADDR;
 static const uint32_t DEVICE_ID = 0x00000015;
+
+// The build stops until a real MAC is set: with the placeholder the watch compiled fine
+// and then tried to connect to 00:00:00:00:00:00 forever.
+#define MAC_HEX(c) (((c)>='0'&&(c)<='9') || ((c)>='a'&&(c)<='f') || ((c)>='A'&&(c)<='F'))
+#define MAC_BYTE(s,i) (MAC_HEX((s)[3*(i)]) && MAC_HEX((s)[3*(i)+1]))
+static_assert(sizeof(CAMERA_MAC_ADDR)==18 &&
+              MAC_BYTE(CAMERA_MAC_ADDR,0) && MAC_BYTE(CAMERA_MAC_ADDR,1) && MAC_BYTE(CAMERA_MAC_ADDR,2) &&
+              MAC_BYTE(CAMERA_MAC_ADDR,3) && MAC_BYTE(CAMERA_MAC_ADDR,4) && MAC_BYTE(CAMERA_MAC_ADDR,5) &&
+              CAMERA_MAC_ADDR[2]==':' && CAMERA_MAC_ADDR[5]==':' && CAMERA_MAC_ADDR[8]==':' &&
+              CAMERA_MAC_ADDR[11]==':' && CAMERA_MAC_ADDR[14]==':',
+              "Set CAMERA_MAC_ADDR to your camera's BLE MAC (DJI Mimo -> About), e.g. \"AA:BB:CC:DD:EE:FF\"");
 
 // ─── GPX file format ──────────────────────────────────────
 // Creation: FILE_APPEND — creates file with header + closing tags
@@ -159,7 +174,8 @@ static int16_t touchX = 0, touchY = 0;
 static uint32_t lastTouchMs = 0;
 
 // ═══════════════════════════════════════════════════════════
-// DJI CRC16 — Fletcher variant, init=0x3AA3
+// DJI CRC16 — table-driven CRC-16 (reflected poly 0xA001, as CRC-16/ARC),
+// init=0x3AA3, no final XOR
 // ═══════════════════════════════════════════════════════════
 static const uint16_t crc16_table[256] = {
     0x0000,0xc0c1,0xc181,0x0140,0xc301,0x03c0,0x0280,0xc241,
@@ -202,7 +218,8 @@ uint16_t dji_crc16(const uint8_t* d, size_t l) {
 }
 
 // ═══════════════════════════════════════════════════════════
-// DJI CRC32 — Fletcher variant, init=0x00003AA3
+// DJI CRC32 — table-driven CRC-32 (reflected poly 0xEDB88320),
+// init=0x00003AA3, no final XOR
 // ═══════════════════════════════════════════════════════════
 static const uint32_t crc32_table[256] = {
     0x00000000,0x77073096,0xee0e612c,0x990951ba,0x076dc419,0x706af48f,0xe963a535,0x9e6495a3,
@@ -299,6 +316,9 @@ static bool gpsDateOk() {
     return instance.gps.date.isValid() && instance.gps.date.year() >= 2024 &&
            instance.gps.date.month() >= 1 && instance.gps.date.day() >= 1;
 }
+
+// Date and time both usable for a GPX <time> (a fix can come before the date)
+static bool gpsTimeOk() { return gpsDateOk() && instance.gps.time.isValid(); }
 
 // ═══════════════════════════════════════════════════════════
 // Haptics — non-blocking: pulse sequences are played from loop(),
@@ -700,9 +720,10 @@ bool gpxCreateFile(const char* path) {
 }
 
 // Write track point — "r+" + seek: open without truncation, seek to closing tags position
-// No live fix → no point (a gap is better than the last position with a new timestamp)
+// No live fix → no point (a gap is better than the last position with a new timestamp).
+// No GPS date yet → no point either: <time> would be 2000-00-00 (invalid GPX).
 void gpxWriteTrackPoint() {
-    if (!sdReady || gpxPath[0]=='\0' || !gpsFixLive()) return;
+    if (!sdReady || gpxPath[0]=='\0' || !gpsFixLive() || !gpsTimeOk()) return;
     File f = SD.open(gpxPath, "r+");
     if (!f) { logWrite("GPX trkpt open FAIL"); return; }
     uint32_t size = f.size();
@@ -730,7 +751,7 @@ void gpxWriteTrackPoint() {
 // (BITE): then the day's waypoint file, so a mark is never lost.
 // Returns false if nothing was written (no live fix, no date, SD error).
 bool gpxWriteWaypoint(const char* name, bool anyTime) {
-    if (!sdReady || !gpsFixLive()) return false;
+    if (!sdReady || !gpsFixLive() || !gpsTimeOk()) return false;
     char path[sizeof(wptPath)];
     if (wptPath[0]) {
         strcpy(path, wptPath);
@@ -828,7 +849,10 @@ static void logResumeTry() {
 void toggleRecording() {
     if (!connected) {
         if (wakeLinkMs) { logWrite("REC tap ignored: still waking the camera"); return; }
-        if (isRecording) {   // link lost while recording: STOP can't reach the camera
+        // Link lost while recording: STOP can't reach the camera. loop() normally clears
+        // isRecording first; this catches a drop (BLE task, other core) between that check
+        // and the tap — without it a STOP tap would wake the camera and START instead.
+        if (isRecording) {
             // Delayed: if this was the 1st tap of a "connect" double tap, the 2nd tap replaces it
             hapticSeq(15,1,0,DOUBLE_TAP_MS);
             logWrite("REC ignored: camera not connected");
@@ -1014,7 +1038,7 @@ void saveBite() {
     } else {
         hapticError();
         logWrite(!gpsFixLive() ? "BITE ignored: no GPS fix"
-               : !gpsDateOk()  ? "BITE ignored: no GPS date"
+               : !gpsTimeOk()  ? "BITE ignored: no GPS date"
                                : "BITE ignored: SD write error");
     }
 }
