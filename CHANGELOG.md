@@ -8,6 +8,25 @@ ESP-IDF firmware for M5Stack / Waveshare boards that this project was forked
 from; that firmware still lives in the repo (`protocol/`, `ble/`, `logic/`,
 `main/`, `sdkconfig.defaults.*`) and serves as the protocol reference.
 
+## [Unreleased]
+
+### Changed
+
+- **CI builds the T-Watch sketch** — The GitHub workflow compiled and released the
+  legacy ESP-IDF firmware (M5Stack / Waveshare) on a `v*` tag. It now compiles
+  `arduino/DJI_Remote_T-Watch` with the pinned core and libraries from
+  `WORKING_LIBRARIES.md` on every push, pull request and tag; a `v*` tag creates a
+  release from `RELEASE_NOTES.md` without a binary (the camera MAC is compiled in).
+- **Camera MAC is checked at build time** — With the `xx:xx:…` placeholder the sketch
+  used to compile and then try to connect to `00:00:00:00:00:00` forever; now the build
+  stops with a message. The MAC is set as `CAMERA_MAC_ADDR` (also as a `-D` flag).
+
+### Fixed
+
+- **GPX `<time>` before the GPS date** — Track points and waypoints written after a fix
+  but before the receiver knew the date carried a zero date (invalid GPX); they are
+  skipped until date and time are known.
+
 ## [v2.1.0] — 2026-10 — Camera state, confirmed recording, GPX per day
 
 A code review of the Arduino port plus on-device tests and an analysis of field

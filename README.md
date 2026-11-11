@@ -156,6 +156,7 @@ its closing tags, and GPX 1.1 requires `<wpt>` before `<trk>`.
 | lvgl | 9.4.0 | LilyGoLib-ThirdParty ⚠️ do not update |
 | NimBLE-Arduino | 2.5.0 | Arduino Library Manager |
 | TinyGPSPlus | 1.1.0 | Separate library; LilyGoLib's `GPS` class derives from it |
+| XPowersLib | 0.3.1* | [github.com/lewisxhe/XPowersLib](https://github.com/lewisxhe/XPowersLib) at commit `85213b2` — *the 0.3.1 release from Library Manager lacks `writeGaugeData()` that LilyGoLib needs |
 | NFC-RFAL-fork | 1.0.1 | [github.com/lewisxhe/NFC-RFAL-fork](https://github.com/lewisxhe/NFC-RFAL-fork) |
 | ST25R3916-fork | 1.1.0 | [github.com/lewisxhe/ST25R3916-fork](https://github.com/lewisxhe/ST25R3916-fork) |
 
@@ -163,9 +164,9 @@ its closing tags, and GPX 1.1 requires `<wpt>` before `<trk>`.
 
 1. Open `arduino/DJI_Remote_T-Watch/DJI_Remote_T-Watch.ino` in Arduino IDE
 2. Select board: **LILYGO T-Watch Ultra (SX1262)**
-3. Set your camera MAC address in the sketch:
+3. Set your camera MAC address in the sketch (the build stops with an error until you do):
 ```cpp
-static const char* CAMERA_MAC = "xx:xx:xx:xx:xx:xx";
+#define CAMERA_MAC_ADDR "AA:BB:CC:DD:EE:FF"
 ```
 4. Upload via COM port (auto-detected, no button press needed)
 

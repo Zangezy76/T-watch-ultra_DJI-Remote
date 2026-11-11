@@ -17,6 +17,7 @@
 | lvgl | 9.4.0 | LilyGoLib-ThirdParty (НЕ обновлять!) |
 | NimBLE-Arduino | 2.5.0 | Arduino Library Manager |
 | TinyGPSPlus | 1.1.0 | отдельная библиотека; класс GPS из LilyGoLib наследует TinyGPSPlus |
+| XPowersLib | 0.3.1* | github.com/lewisxhe/XPowersLib, коммит 85213b2 (ноябрь 2025). *Релиз 0.3.1 из Library Manager НЕ подходит: в нём нет `writeGaugeData()`, нужной LilyGoLib |
 
 ## NFC библиотеки
 | Библиотека | Версия | Источник |
