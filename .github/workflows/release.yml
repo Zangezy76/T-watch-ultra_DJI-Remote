@@ -25,6 +25,8 @@ env:
   TINYGPSPLUS_REF: 0a205759da22a1c54c5f5285480fe6132592a4e2      # TinyGPSPlus 1.1.0
   NFC_RFAL_REF: 7bde4587ea44c36c178a43d083d7a7345c1e4cfe         # NFC-RFAL-fork 1.0.1
   ST25R3916_REF: 0c8e00f49d12881d1cff6d6f0879b90ce7ed4033        # ST25R3916-fork 1.1.0
+  # Says 0.3.1, but newer than the 0.3.1 release: LilyGoLib needs writeGaugeData()
+  XPOWERSLIB_REF: 85213b21aba8e81dffcc015a8da0804743e0da2f       # XPowersLib master, 2025-11-06
 
 jobs:
   build:
@@ -48,7 +50,7 @@ jobs:
           LIB="$(arduino-cli config get directories.user)/libraries"
           mkdir -p "$LIB"
           arduino-cli lib update-index
-          arduino-cli lib install "NimBLE-Arduino@2.5.0" "XPowersLib@0.3.1"
+          arduino-cli lib install "NimBLE-Arduino@2.5.0"
 
           clone() {   # clone <repo> <commit> <dir>
             git clone --quiet --filter=blob:none "https://github.com/$1.git" "$3"
@@ -58,6 +60,7 @@ jobs:
           clone mikalhart/TinyGPSPlus    "$TINYGPSPLUS_REF" "$LIB/TinyGPSPlus"
           clone lewisxhe/NFC-RFAL-fork   "$NFC_RFAL_REF"    "$LIB/NFC-RFAL-fork"
           clone lewisxhe/ST25R3916-fork  "$ST25R3916_REF"   "$LIB/ST25R3916-fork"
+          clone lewisxhe/XPowersLib      "$XPOWERSLIB_REF"  "$LIB/XPowersLib"
           # Only these three come from LilyGoLib-ThirdParty (do not update them)
           clone Xinyuan-LilyGO/LilyGoLib-ThirdParty "$THIRDPARTY_REF" /tmp/thirdparty
           for l in SensorLib RadioLib lvgl; do cp -r "/tmp/thirdparty/$l" "$LIB/"; done
