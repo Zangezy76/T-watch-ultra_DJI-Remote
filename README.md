@@ -36,6 +36,8 @@ A custom BLE remote control for DJI Osmo Action 5 Pro built on LILYGO T-Watch Ul
 
 ## 🎮 Controls
 
+[Как пользоваться GPS-логгером на часах — инструкция на русском](docs/logger-guide-ru.md)
+
 ```
 ┌─────────────────────────┐
 │  08:42 UTC   [cam] REC  │
