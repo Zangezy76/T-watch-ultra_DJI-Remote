@@ -317,8 +317,45 @@ static bool gpsDateOk() {
            instance.gps.date.month() >= 1 && instance.gps.date.day() >= 1;
 }
 
-// Date and time both usable for a GPX <time> (a fix can come before the date)
-static bool gpsTimeOk() { return gpsDateOk() && instance.gps.time.isValid(); }
+// RMC carries both date and UTC. GGA can advance the clock past midnight before
+// the next RMC arrives. Keep the raw RMC fields, including empty fields that
+// TinyGPSPlus otherwise treats as the previously decoded value.
+static struct {
+    const char* sentence;
+    TinyGPSCustom date, time;
+} gpxRmc[] = {{"GNRMC"}, {"GPRMC"}, {"GLRMC"}, {"GARMC"}, {"GBRMC"}};
+
+static void initGpxClock() {
+    for (auto& rmc : gpxRmc) {
+        rmc.date.begin(instance.gps, rmc.sentence, 9);
+        rmc.time.begin(instance.gps, rmc.sentence, 1);
+    }
+}
+
+static int secondsOfDay(uint32_t hhmmss) {
+    return (hhmmss / 10000) * 3600 + (hhmmss / 100 % 100) * 60 + hhmmss % 100;
+}
+
+static bool gpxTimeOk() {
+    if (!gpsDateOk() || !instance.gps.time.isValid() ||
+        instance.gps.time.hour() >= 24 || instance.gps.time.minute() >= 60 ||
+        instance.gps.time.second() >= 60) return false;
+
+    int fixSeconds = secondsOfDay(instance.gps.time.value() / 100);
+    for (auto& rmc : gpxRmc) {
+        if (rmc.date.age() >= GPS_FIX_MAX_AGE_MS) continue;
+        const char* date = rmc.date.value();
+        const char* time = rmc.time.value();
+        if (strlen(date) != 6 || strspn(date, "0123456789") != 6 ||
+            strtoul(date, nullptr, 10) != instance.gps.date.value() ||
+            strspn(time, "0123456789") != 6) continue;
+
+        // Compare seconds within the same day, without wrapping at midnight.
+        int rmcSeconds = secondsOfDay(strtoul(time, nullptr, 10));
+        if (abs(fixSeconds - rmcSeconds) <= GPS_FIX_MAX_AGE_MS / 1000) return true;
+    }
+    return false;
+}
 
 // ═══════════════════════════════════════════════════════════
 // Haptics — non-blocking: pulse sequences are played from loop(),
@@ -651,7 +688,7 @@ void sendGpsPayload() {
 // Restarting the logger the same day continues the file with a new <trkseg>, so an
 // accidental stop/start no longer splits the trip into many files.
 static bool gpxDailyPaths(char* trk, size_t trkLen, char* wpt, size_t wptLen) {
-    if (!gpsDateOk()) return false;
+    if (!gpxTimeOk()) return false;
     int y=instance.gps.date.year(), m=instance.gps.date.month(), d=instance.gps.date.day();
     snprintf(trk, trkLen, "/track_%04d_%02d_%02d.gpx", y, m, d);
     snprintf(wpt, wptLen, "/track_%04d_%02d_%02d_wpt.gpx", y, m, d);
@@ -705,7 +742,7 @@ bool gpxCreateFile(const char* path) {
     f.print("  xsi:schemaLocation=\"http://www.topografix.com/GPX/1/1 ");
     f.print("http://www.topografix.com/GPX/1/1/gpx.xsd\">\n");
     char header[64];
-    if (gpsDateOk())
+    if (gpxTimeOk())
         snprintf(header, sizeof(header), "  <trk>\n    <name>%04d-%02d-%02d</name>\n" TRKSEG_OPEN,
             instance.gps.date.year(), instance.gps.date.month(), instance.gps.date.day());
     else
@@ -719,11 +756,18 @@ bool gpxCreateFile(const char* path) {
     return true;
 }
 
+static void gpxWriteTime(File& f, const char* indent) {
+    f.printf("%s<time>%04d-%02d-%02dT%02d:%02d:%02dZ</time>\n", indent,
+        instance.gps.date.year(), instance.gps.date.month(), instance.gps.date.day(),
+        instance.gps.time.hour(), instance.gps.time.minute(), instance.gps.time.second());
+}
+
 // Write track point — "r+" + seek: open without truncation, seek to closing tags position
 // No live fix → no point (a gap is better than the last position with a new timestamp).
 // No GPS date yet → no point either: <time> would be 2000-00-00 (invalid GPX).
 void gpxWriteTrackPoint() {
-    if (!sdReady || gpxPath[0]=='\0' || !gpsFixLive() || !gpsTimeOk()) return;
+    if (!sdReady || gpxPath[0]=='\0' || !gpsFixLive() || !gpxTimeOk()) return;
+    lastTrackMs = millis();
     File f = SD.open(gpxPath, "r+");
     if (!f) { logWrite("GPX trkpt open FAIL"); return; }
     uint32_t size = f.size();
@@ -732,11 +776,7 @@ void gpxWriteTrackPoint() {
     f.print("      <trkpt lat=\""); f.print(instance.gps.location.lat(),6);
     f.print("\" lon=\""); f.print(instance.gps.location.lng(),6); f.print("\">\n");
     f.print("        <ele>"); f.print(instance.gps.altitude.isValid()?instance.gps.altitude.meters():0.0,1); f.print("</ele>\n");
-    char tbuf[48];
-    snprintf(tbuf,sizeof(tbuf),"        <time>%04d-%02d-%02dT%02d:%02d:%02dZ</time>\n",
-        instance.gps.date.year(),instance.gps.date.month(),instance.gps.date.day(),
-        instance.gps.time.hour(),instance.gps.time.minute(),instance.gps.time.second());
-    f.print(tbuf);
+    gpxWriteTime(f, "        ");
     f.print("      </trkpt>\n");
     f.print(TRKSEG_CLOSE);
     f.print(GPX_CLOSE);
@@ -748,16 +788,17 @@ void gpxWriteTrackPoint() {
 // NOTE: wpt cannot go in the main track file because the next trkpt write
 // (seek from end - FULL_CLOSE_LEN) would overwrite the wpt data.
 // Logger on → this session's waypoint file. Logger off → nothing, unless anyTime
-// (BITE): then the day's waypoint file, so a mark is never lost.
-// Returns false if nothing was written (no live fix, no date, SD error).
+// (BITE): then the day's waypoint file, or the undated file before UTC is known.
 bool gpxWriteWaypoint(const char* name, bool anyTime) {
-    if (!sdReady || !gpsFixLive() || !gpsTimeOk()) return false;
+    if (!sdReady || !gpsFixLive()) return false;
     char path[sizeof(wptPath)];
     if (wptPath[0]) {
         strcpy(path, wptPath);
     } else {
         char trk[sizeof(gpxPath)];
-        if (!anyTime || !gpxDailyPaths(trk,sizeof(trk),path,sizeof(path)) || !gpxEnsureWptFile(path)) return false;
+        if (!anyTime) return false;
+        if (!gpxDailyPaths(trk, sizeof(trk), path, sizeof(path))) strcpy(path, "/track_undated_wpt.gpx");
+        if (!gpxEnsureWptFile(path)) return false;
     }
     File f = SD.open(path, "r+");
     if (!f) { logWritef("GPX wpt open FAIL: %s", name); return false; }
@@ -767,11 +808,7 @@ bool gpxWriteWaypoint(const char* name, bool anyTime) {
     f.print("  <wpt lat=\""); f.print(instance.gps.location.lat(),6);
     f.print("\" lon=\""); f.print(instance.gps.location.lng(),6); f.print("\">\n");
     f.print("    <ele>"); f.print(instance.gps.altitude.isValid()?instance.gps.altitude.meters():0.0,1); f.print("</ele>\n");
-    char tbuf[48];
-    snprintf(tbuf,sizeof(tbuf),"    <time>%04d-%02d-%02dT%02d:%02d:%02dZ</time>\n",
-        instance.gps.date.year(),instance.gps.date.month(),instance.gps.date.day(),
-        instance.gps.time.hour(),instance.gps.time.minute(),instance.gps.time.second());
-    f.print(tbuf);
+    if (gpxTimeOk()) gpxWriteTime(f, "    ");
     f.print("    <name>"); f.print(name); f.print("</name>\n");
     f.print("  </wpt>\n");
     f.print(GPX_CLOSE);
@@ -935,8 +972,8 @@ void toggleLogger() {
         // Companion wpt file (waypoints can't share the track file due to the seek writes)
         gpxEnsureWptFile(wptPath);
         haptic(14);
-        gpxWriteTrackPoint();   // первая точка сразу, не ждать 60 сек
-        lastTrackMs = millis();
+        lastTrackMs = millis() - TRACK_INTERVAL_MS;   // first point as soon as fix and UTC are ready
+        gpxWriteTrackPoint();
         logResumeSave();
         renderLog();
         logWritef("Logger START: %s%s", gpxPath, continued?" (continued, new segment)":"");
@@ -1024,7 +1061,7 @@ void handleTouchEnd(int16_t x, int16_t y, uint32_t duration) {
 }
 
 // BITE waypoint (lower double tap or side-button double click). Logger on → this
-// session's waypoint file, logger off → the day's waypoint file. 3 buzzes = saved.
+// session's waypoint file, logger off → daily or undated waypoint file. 3 buzzes = saved.
 void saveBite() {
     static int biteCount = 0;
     char name[16];
@@ -1034,12 +1071,10 @@ void saveBite() {
         hapticSeq(14,3,150,0);
         logWritef("Waypoint: %s %.5f,%.5f%s", name,
             instance.gps.location.lat(), instance.gps.location.lng(),
-            gpxLogging?"":" (logger off, day file)");
+            gpxLogging?"":" (logger off)");
     } else {
         hapticError();
-        logWrite(!gpsFixLive() ? "BITE ignored: no GPS fix"
-               : !gpsTimeOk()  ? "BITE ignored: no GPS date"
-                               : "BITE ignored: SD write error");
+        logWrite(!gpsFixLive() ? "BITE ignored: no GPS fix" : "BITE ignored: SD write error");
     }
 }
 
@@ -1606,6 +1641,7 @@ void setup() {
 
     // instance.begin() initializes all hardware including SD card mount
     instance.begin();
+    initGpxClock();
     beginLvglHelper(instance);
     instance.setBrightness(200);
     startMs = millis();
@@ -1774,8 +1810,7 @@ void loop() {
         updateUI();
     }
 
-    if (gpxLogging && millis()-lastTrackMs>TRACK_INTERVAL_MS) {
-        lastTrackMs=millis();
+    if (gpxLogging && millis()-lastTrackMs>=TRACK_INTERVAL_MS) {
         gpxWriteTrackPoint();
     }
 

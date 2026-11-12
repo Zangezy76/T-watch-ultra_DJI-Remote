@@ -67,7 +67,7 @@ The side button works with the screen dark (it wakes it too). Holding it while t
 
 **Camera status line:** `Cam:72%` awake (camera battery) · `Cam:zz` switched off / asleep, BLE link still up · `Cam:wake` being woken for REC · `Cam:--` searching (a camera that fell asleep without a link is found only after a wake-up — press REC) · `Cam:~~` link lost, reconnecting.
 
-**Vibration:** 1 = recording started / logger toggled · 2 = recording stopped · 3 = BITE saved · soft bump = waking the camera · long buzz = not done (camera did not confirm / not connected; for BITE — no GPS fix, date or SD).
+**Vibration:** 1 = recording started / logger toggled · 2 = recording stopped · 3 = BITE saved · soft bump = waking the camera · long buzz = not done (camera did not confirm / not connected; for BITE — no live GPS fix or SD write failed).
 
 ---
 
@@ -110,7 +110,11 @@ same day, a new `<trkseg>` segment starts in the same file:
 /log_2026_05_24.txt         ← event log with timestamps
 ```
 
-Before the GPS knows the date, the logger writes `/track_session_NNN.gpx` instead.
+Starting the logger before GPS confirms UTC creates `/track_session_NNN.gpx`.
+Track points start when both a live fix and UTC are available. BITE and REC
+marks with a live fix are saved immediately in the session's waypoint file.
+Their `<time>` element is omitted until UTC is known. With the logger off,
+BITE marks made during this interval go to `/track_undated_wpt.gpx`.
 
 **Track point:**
 ```xml

@@ -23,9 +23,11 @@ from; that firmware still lives in the repo (`protocol/`, `ble/`, `logic/`,
 
 ### Fixed
 
-- **GPX `<time>` before the GPS date** — Track points and waypoints written after a fix
-  but before the receiver knew the date carried a zero date (invalid GPX); they are
-  skipped until date and time are known.
+- GPX timestamps use the date and UTC from a recent RMC sentence to check the
+  fix time. A track point due at midnight waits for the receiver to confirm the new date.
+- BITE and REC waypoints keep their coordinates when UTC is unavailable and omit
+  the optional `<time>` element. With the logger off, undated BITE marks go to
+  `/track_undated_wpt.gpx`.
 
 ## [v2.1.0] — 2026-10 — Camera state, confirmed recording, GPX per day
 

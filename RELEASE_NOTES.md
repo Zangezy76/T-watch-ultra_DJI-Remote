@@ -65,11 +65,13 @@ This release ships as an Arduino sketch, not a pre-built web-flash binary.
    LVGL 9.4.0, NimBLE-Arduino 2.5.0, TinyGPSPlus 1.1.0).
 3. Open `arduino/DJI_Remote_T-Watch/DJI_Remote_T-Watch.ino`.
 4. Select board: **LILYGO T-Watch Ultra (SX1262)**.
-5. Set your camera's BLE MAC in the sketch:
+5. Replace the example address below with the BLE MAC shown for your camera
+   in DJI Mimo → Camera Settings → About.
+
    ```cpp
-   static const char* CAMERA_MAC = "xx:xx:xx:xx:xx:xx";
+   #define CAMERA_MAC_ADDR "AA:BB:CC:DD:EE:FF"
    ```
-   (Find it in DJI Mimo → Camera Settings → About.)
+
 6. Upload via the COM port (auto-detected, no button press needed). If the
    sketch file was changed outside the IDE, reopen it first — an open tab may
    upload stale text.
