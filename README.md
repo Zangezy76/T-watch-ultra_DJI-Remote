@@ -75,7 +75,7 @@ The side button works with the screen dark (it wakes it too). Holding it while t
 
 ## 📡 DJI BLE Protocol
 
-Reverse-engineered from the original [DJI-Remote](https://github.com/nicholaswilde/DJI-Remote) project (ESP-IDF).
+The BLE protocol was studied using the original [DJI-Remote](https://github.com/nicholaswilde/DJI-Remote) project and [DJI's Osmo GPS Controller Demo](https://github.com/dji-sdk/Osmo-GPS-Controller-Demo).
 
 **Frame format:**
 ```
@@ -193,11 +193,8 @@ arduino-cli compile --fqbn esp32:esp32:twatch_ultra -u -p COM6 arduino/DJI_Remot
 DJI-Remote/
 ├── arduino/
 │   └── DJI_Remote_T-Watch/     ← Main Arduino sketch
-├── protocol/                   ← DJI BLE protocol (ESP-IDF, C)
-├── ble/                        ← BLE layer
-├── logic/                      ← Command logic
-├── utils/crc/                  ← CRC16/CRC32 implementation
-├── docs/                       ← Documentation & images
+├── docs/                       ← T-Watch guide & images
+├── .github/workflows/          ← Arduino build and release
 ├── WORKING_LIBRARIES.md        ← Verified library versions
 └── README.md
 ```
@@ -221,7 +218,7 @@ DJI-Remote/
 
 ## 📜 Background
 
-This project started as a fork of [DJI-Remote](https://github.com/nicholaswilde/DJI-Remote) (ESP-IDF). The protocol was reverse-engineered from that codebase. The Arduino/LilyGoLib port was built from scratch to run on the T-Watch Ultra wristwatch.
+This project started as a fork of [DJI-Remote](https://github.com/nicholaswilde/DJI-Remote) (ESP-IDF). Its protocol research informed the Arduino/LilyGoLib implementation built for the T-Watch Ultra wristwatch. The original ESP-IDF firmware is no longer part of this repository.
 
 Use case: fishing from a boat — camera mounted on the boat, watch on wrist. One press starts recording, GPS coordinates are overlaid on the video in DJI Mimo, and the route is logged as a GPX track.
 
@@ -231,7 +228,7 @@ Use case: fishing from a boat — camera mounted on the boat, watch on wrist. On
 
 This project is licensed under the [**MIT License**](https://opensource.org/licenses/MIT). See [`LICENSE`](LICENSE).
 
-Third-party licenses (DJI, ESP-IDF, MIT legacy) are listed in [`THIRD_PARTY_NOTICES.md`](THIRD_PARTY_NOTICES.md).
+Third-party licenses and attribution are listed in [`THIRD_PARTY_NOTICES.md`](THIRD_PARTY_NOTICES.md).
 
 ## Support
 
