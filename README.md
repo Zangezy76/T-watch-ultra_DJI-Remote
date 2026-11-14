@@ -75,7 +75,7 @@ The side button works with the screen dark (it wakes it too). Holding it while t
 
 ## 📡 DJI BLE Protocol
 
-The BLE protocol was studied using the original [DJI-Remote](https://github.com/nicholaswilde/DJI-Remote) project and [DJI's Osmo GPS Controller Demo](https://github.com/dji-sdk/Osmo-GPS-Controller-Demo).
+The BLE protocol was studied using the original [DJI-Remote](https://github.com/rhoenschrat/DJI-Remote) project and [DJI's Osmo GPS Controller Demo](https://github.com/dji-sdk/Osmo-GPS-Controller-Demo).
 
 **Frame format:**
 ```
@@ -234,7 +234,7 @@ DJI-Remote/
 
 ## 📜 Background
 
-This project started as a fork of [DJI-Remote](https://github.com/nicholaswilde/DJI-Remote) (ESP-IDF). Its protocol research informed the Arduino/LilyGoLib implementation built for the T-Watch Ultra wristwatch. The original ESP-IDF firmware is no longer part of this repository.
+This project started as a fork of [DJI-Remote](https://github.com/rhoenschrat/DJI-Remote) (ESP-IDF). Its protocol research informed the Arduino/LilyGoLib implementation built for the T-Watch Ultra wristwatch. The original ESP-IDF firmware is no longer part of this repository.
 
 Use case: fishing from a boat — camera mounted on the boat, watch on wrist. One press starts recording, GPS coordinates are overlaid on the video in DJI Mimo, and the route is logged as a GPX track.
 
