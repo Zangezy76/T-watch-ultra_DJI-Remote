@@ -1,8 +1,8 @@
 name: Build T-Watch sketch / Release
 
-# Compiles the T-Watch Ultra Arduino sketch (arduino/DJI_Remote_T-Watch) with the exact
-# core and library versions from WORKING_LIBRARIES.md, on every push to main, every pull
-# request and every v* tag. A v* tag also creates a GitHub Release from RELEASE_NOTES.md.
+# Compiles the T-Watch Ultra Arduino sketch with tools/build.py's pinned dependencies
+# on every push to main, every pull request and every v* tag. A v* tag also creates
+# a GitHub Release from RELEASE_NOTES.md.
 #
 # No firmware binary is attached: the camera's BLE MAC is compiled into the sketch, so a
 # prebuilt .bin would not work with anyone's camera. CI builds with a dummy MAC only to
@@ -14,19 +14,6 @@ on:
     tags: ['v*']
   pull_request:
 
-env:
-  ESP32_CORE: "3.3.12"
-  FQBN: esp32:esp32:twatch_ultra
-  SKETCH: arduino/DJI_Remote_T-Watch
-  # Pinned to the versions verified on the watch (see WORKING_LIBRARIES.md)
-  LILYGOLIB_REF: c3f182870f3300c848c2b6a10976ba0e9ec9fbe7        # LilyGoLib 0.1.0
-  THIRDPARTY_REF: c8e6de3b4684df60101569cfe8ead8adbbb79643       # SensorLib 0.3.3, RadioLib 7.4.0, lvgl 9.4.0
-  TINYGPSPLUS_REF: 0a205759da22a1c54c5f5285480fe6132592a4e2      # TinyGPSPlus 1.1.0
-  NFC_RFAL_REF: 7bde4587ea44c36c178a43d083d7a7345c1e4cfe         # NFC-RFAL-fork 1.0.1
-  ST25R3916_REF: 0c8e00f49d12881d1cff6d6f0879b90ce7ed4033        # ST25R3916-fork 1.1.0
-  # Says 0.3.1, but newer than the 0.3.1 release: LilyGoLib needs writeGaugeData()
-  XPOWERSLIB_REF: 85213b21aba8e81dffcc015a8da0804743e0da2f       # XPowersLib master, 2025-11-06
-
 jobs:
   build:
     runs-on: ubuntu-latest
@@ -35,41 +22,8 @@ jobs:
 
       - uses: arduino/setup-arduino-cli@v2
 
-      - name: Install esp32 core ${{ env.ESP32_CORE }}
-        run: |
-          arduino-cli config init
-          arduino-cli config add board_manager.additional_urls https://espressif.github.io/arduino-esp32/package_esp32_index.json
-          arduino-cli core update-index
-          arduino-cli core install "esp32:esp32@${ESP32_CORE}"
-
-      - name: Install libraries
-        shell: bash
-        run: |
-          set -euo pipefail
-          LIB="$(arduino-cli config get directories.user)/libraries"
-          mkdir -p "$LIB"
-          arduino-cli lib update-index
-          arduino-cli lib install "NimBLE-Arduino@2.5.0"
-
-          clone() {   # clone <repo> <commit> <dir>
-            git clone --quiet --filter=blob:none "https://github.com/$1.git" "$3"
-            git -C "$3" checkout --quiet "$2"
-          }
-          clone Xinyuan-LilyGO/LilyGoLib "$LILYGOLIB_REF"   "$LIB/LilyGoLib"
-          clone mikalhart/TinyGPSPlus    "$TINYGPSPLUS_REF" "$LIB/TinyGPSPlus"
-          clone lewisxhe/NFC-RFAL-fork   "$NFC_RFAL_REF"    "$LIB/NFC-RFAL-fork"
-          clone lewisxhe/ST25R3916-fork  "$ST25R3916_REF"   "$LIB/ST25R3916-fork"
-          clone lewisxhe/XPowersLib      "$XPOWERSLIB_REF"  "$LIB/XPowersLib"
-          # Only these three come from LilyGoLib-ThirdParty (do not update them)
-          clone Xinyuan-LilyGO/LilyGoLib-ThirdParty "$THIRDPARTY_REF" /tmp/thirdparty
-          for l in SensorLib RadioLib lvgl; do cp -r "/tmp/thirdparty/$l" "$LIB/"; done
-          arduino-cli lib list
-
       - name: Compile (dummy camera MAC)
-        run: |
-          arduino-cli compile --fqbn "$FQBN" --warnings default \
-            --build-property 'compiler.cpp.extra_flags=-DCAMERA_MAC_ADDR="00:00:00:00:00:01"' \
-            "$SKETCH"
+        run: python3 tools/build.py --mac 00:00:00:00:00:01
 
   release:
     if: startsWith(github.ref, 'refs/tags/v')

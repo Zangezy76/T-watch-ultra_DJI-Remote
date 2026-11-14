@@ -152,6 +152,18 @@ its closing tags, and GPX 1.1 requires `<wpt>` before `<trk>`.
 - Board: **esp32 by Espressif Systems 3.3.12** (3.3.8 used up to v2.0.0)
 - Board config: **LILYGO T-Watch Ultra**
 
+For a repeatable command-line build, install Python 3, Git and Arduino CLI,
+then run from the repository root (use `python3` on macOS/Linux):
+
+```powershell
+python tools/build.py --mac AA:BB:CC:DD:EE:FF
+```
+
+Replace the example with your camera's BLE MAC. The script installs the pinned
+core and libraries used by CI, keeps libraries separate from your Arduino
+sketchbook, and writes the firmware to `.arduino-build/build/`. This build is
+specific to that camera. The cache is ignored by Git.
+
 ### Libraries (exact versions required)
 
 | Library | Version | Source |
@@ -166,6 +178,10 @@ its closing tags, and GPX 1.1 requires `<wpt>` before `<trk>`.
 | NFC-RFAL-fork | 1.0.1 | [github.com/lewisxhe/NFC-RFAL-fork](https://github.com/lewisxhe/NFC-RFAL-fork) |
 | ST25R3916-fork | 1.1.0 | [github.com/lewisxhe/ST25R3916-fork](https://github.com/lewisxhe/ST25R3916-fork) |
 
+The exact Git revisions are pinned in [`tools/build.py`](tools/build.py). Use
+those revisions if installing libraries manually; the latest upstream versions
+may not build this sketch.
+
 ### Flash
 
 1. Open `arduino/DJI_Remote_T-Watch/DJI_Remote_T-Watch.ino` in Arduino IDE
@@ -176,10 +192,9 @@ its closing tags, and GPX 1.1 requires `<wpt>` before `<trk>`.
 ```
 4. Upload via COM port (auto-detected, no button press needed)
 
-Or from the command line:
-```bash
-arduino-cli compile --fqbn esp32:esp32:twatch_ultra -u -p COM6 arduino/DJI_Remote_T-Watch
-```
+For a command-line build, use the script above. It compiles the firmware but
+does not upload it; select the correct port and upload your camera-specific
+binary separately.
 
 > Arduino IDE may upload stale text from an already open tab after the file was changed
 > outside the IDE — reopen the sketch before uploading. After a USB upload the watch can
@@ -194,6 +209,7 @@ DJI-Remote/
 ├── arduino/
 │   └── DJI_Remote_T-Watch/     ← Main Arduino sketch
 ├── docs/                       ← T-Watch guide & images
+├── tools/build.py               ← Pinned command-line build
 ├── .github/workflows/          ← Arduino build and release
 ├── WORKING_LIBRARIES.md        ← Verified library versions
 └── README.md

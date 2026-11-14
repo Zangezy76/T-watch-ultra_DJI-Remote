@@ -14,7 +14,7 @@ esp32 3.3.8. Ядро 3.3.12 может предупреждать о повто
 ## Основные библиотеки
 | Библиотека | Версия | Источник |
 |---|---|---|
-| LilyGoLib | 0.1.0 | github.com/Xinyuan-LilyGO/LilyGoLib (свежая) |
+| LilyGoLib | 0.1.0 | github.com/Xinyuan-LilyGO/LilyGoLib, коммит `c3f1828` из `tools/build.py` |
 | SensorLib | 0.3.3 | LilyGoLib-ThirdParty (НЕ обновлять!) |
 | RadioLib | 7.4.0 | LilyGoLib-ThirdParty (НЕ обновлять!) |
 | lvgl | 9.4.0 | LilyGoLib-ThirdParty (НЕ обновлять!) |
@@ -31,10 +31,18 @@ esp32 3.3.8. Ядро 3.3.12 может предупреждать о повто
 ## Важные заметки
 
 ### Установка
-1. Установить esp32 core 3.3.12 через Boards Manager
-2. Клонировать LilyGoLib в Arduino/libraries/
-3. Клонировать LilyGoLib-ThirdParty и скопировать ВСЕ папки в Arduino/libraries/
-4. Заменить SensorLib, RadioLib, lvgl на версии из ThirdParty
+Для повторяемой сборки установите Python 3, Git и Arduino CLI. Из корня
+репозитория запустите `python tools/build.py --mac AA:BB:CC:DD:EE:FF`
+(`python3` на macOS/Linux), подставив MAC вашей камеры. Скрипт установит ядро
+esp32 3.3.12 и точные ревизии библиотек из `tools/build.py`. Библиотеки и
+результат сборки окажутся в `.arduino-build/`, отдельно от обычного Arduino
+sketchbook. Папка не попадает в Git.
+
+Для ручной установки через Arduino IDE используйте те же коммиты, что указаны
+в `tools/build.py`: `LilyGoLib` 0.1.0; `SensorLib`, `RadioLib` и `lvgl` из
+закреплённого коммита `LilyGoLib-ThirdParty`; `XPowersLib` именно из коммита
+`85213b2`, а не одноимённый релиз из Library Manager. Остальные зависимости
+и их версии перечислены выше.
 
 ### НЕ обновлять автоматически!
 Arduino IDE будет предлагать обновить библиотеки — ОТКАЗЫВАТЬ.
