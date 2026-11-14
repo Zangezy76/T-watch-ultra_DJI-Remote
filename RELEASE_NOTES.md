@@ -1,13 +1,23 @@
 # Release Notes
 
-## DJI-Remote v2.1.0 — Camera state, confirmed recording, GPX per day
+## DJI-Remote v2.1.1 — T-Watch Ultra release
 
 A custom BLE remote for the **DJI Osmo Action 5 Pro**, running on the
 **LILYGO T-Watch Ultra** (ESP32-S3R8) as an Arduino sketch built on LilyGoLib.
 It controls recording from the wrist, injects real-time GPS for overlay in
 DJI Mimo, and logs GPX tracks to SD card.
 
-### What's New in v2.1.0
+### What's in v2.1.1
+
+- **GPX timestamps at midnight** — Track points wait for a matching GPS date
+  and UTC time; the logger writes the point when the receiver confirms them.
+- **Waypoints before UTC is available** — BITE and REC marks retain their
+  coordinates without a `<time>` element. With the logger off, undated BITE
+  marks go to `/track_undated_wpt.gpx`.
+- **T-Watch-only repository** — Removed the inherited ESP-IDF firmware and its
+  M5Stack/Waveshare documentation. The watch photo is now easier to read.
+
+The release also includes the T-Watch features introduced in v2.1.0:
 
 - **Real camera state** — `Cam:72%` (awake, camera battery), `Cam:zz` (switched
   off but still linked over BLE), `Cam:wake`, `Cam:~~` (link lost).
@@ -65,11 +75,13 @@ This release ships as an Arduino sketch, not a pre-built web-flash binary.
    LVGL 9.4.0, NimBLE-Arduino 2.5.0, TinyGPSPlus 1.1.0).
 3. Open `arduino/DJI_Remote_T-Watch/DJI_Remote_T-Watch.ino`.
 4. Select board: **LILYGO T-Watch Ultra (SX1262)**.
-5. Set your camera's BLE MAC in the sketch:
+5. Replace the example address below with the BLE MAC shown for your camera
+   in DJI Mimo → Camera Settings → About.
+
    ```cpp
-   static const char* CAMERA_MAC = "xx:xx:xx:xx:xx:xx";
+   #define CAMERA_MAC_ADDR "AA:BB:CC:DD:EE:FF"
    ```
-   (Find it in DJI Mimo → Camera Settings → About.)
+
 6. Upload via the COM port (auto-detected, no button press needed). If the
    sketch file was changed outside the IDE, reopen it first — an open tab may
    upload stale text.
@@ -80,11 +92,5 @@ This release ships as an Arduino sketch, not a pre-built web-flash binary.
 - **Kamchatka ascent, 20.06.2026** — 142 points over 2 h 21 min, 21 km,
   +1290 m of gain (413 → 1703 m), no dropped points.
 
----
-
-### About the ESP-IDF firmware (M5Stack / Waveshare)
-
-The original ESP-IDF firmware for M5Stack Basic V2.7 and Waveshare
-ESP32-S3-LCD-1.9 remains in this repository as the protocol reference. Its
-release history is documented in [`CHANGELOG.md`](CHANGELOG.md) under the
-`v1.x` entries.
+The v2.1.1 GPX fixes passed host-side checks and the T-Watch sketch compiled
+with ESP32 core 3.3.12. The GPX fixes have not yet been tested on the watch.

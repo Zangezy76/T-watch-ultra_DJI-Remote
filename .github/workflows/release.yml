@@ -6,8 +6,7 @@ name: Build T-Watch sketch / Release
 #
 # No firmware binary is attached: the camera's BLE MAC is compiled into the sketch, so a
 # prebuilt .bin would not work with anyone's camera. CI builds with a dummy MAC only to
-# prove the sketch compiles. (The legacy ESP-IDF firmware for M5Stack / Waveshare is no
-# longer released from here; tools/release/build_release.sh still packages it by hand.)
+# prove the sketch compiles.
 
 on:
   push:

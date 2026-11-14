@@ -36,6 +36,8 @@ A custom BLE remote control for DJI Osmo Action 5 Pro built on LILYGO T-Watch Ul
 
 ## 🎮 Controls
 
+[Как пользоваться GPS-логгером на часах — инструкция на русском](docs/logger-guide-ru.md)
+
 ```
 ┌─────────────────────────┐
 │  08:42 UTC   [cam] REC  │
@@ -67,13 +69,13 @@ The side button works with the screen dark (it wakes it too). Holding it while t
 
 **Camera status line:** `Cam:72%` awake (camera battery) · `Cam:zz` switched off / asleep, BLE link still up · `Cam:wake` being woken for REC · `Cam:--` searching (a camera that fell asleep without a link is found only after a wake-up — press REC) · `Cam:~~` link lost, reconnecting.
 
-**Vibration:** 1 = recording started / logger toggled · 2 = recording stopped · 3 = BITE saved · soft bump = waking the camera · long buzz = not done (camera did not confirm / not connected; for BITE — no GPS fix, date or SD).
+**Vibration:** 1 = recording started / logger toggled · 2 = recording stopped · 3 = BITE saved · soft bump = waking the camera · long buzz = not done (camera did not confirm / not connected; for BITE — no live GPS fix or SD write failed).
 
 ---
 
 ## 📡 DJI BLE Protocol
 
-Reverse-engineered from the original [DJI-Remote](https://github.com/nicholaswilde/DJI-Remote) project (ESP-IDF).
+The BLE protocol was studied using the original [DJI-Remote](https://github.com/nicholaswilde/DJI-Remote) project and [DJI's Osmo GPS Controller Demo](https://github.com/dji-sdk/Osmo-GPS-Controller-Demo).
 
 **Frame format:**
 ```
@@ -110,7 +112,11 @@ same day, a new `<trkseg>` segment starts in the same file:
 /log_2026_05_24.txt         ← event log with timestamps
 ```
 
-Before the GPS knows the date, the logger writes `/track_session_NNN.gpx` instead.
+Starting the logger before GPS confirms UTC creates `/track_session_NNN.gpx`.
+Track points start when both a live fix and UTC are available. BITE and REC
+marks with a live fix are saved immediately in the session's waypoint file.
+Their `<time>` element is omitted until UTC is known. With the logger off,
+BITE marks made during this interval go to `/track_undated_wpt.gpx`.
 
 **Track point:**
 ```xml
@@ -187,11 +193,8 @@ arduino-cli compile --fqbn esp32:esp32:twatch_ultra -u -p COM6 arduino/DJI_Remot
 DJI-Remote/
 ├── arduino/
 │   └── DJI_Remote_T-Watch/     ← Main Arduino sketch
-├── protocol/                   ← DJI BLE protocol (ESP-IDF, C)
-├── ble/                        ← BLE layer
-├── logic/                      ← Command logic
-├── utils/crc/                  ← CRC16/CRC32 implementation
-├── docs/                       ← Documentation & images
+├── docs/                       ← T-Watch guide & images
+├── .github/workflows/          ← Arduino build and release
 ├── WORKING_LIBRARIES.md        ← Verified library versions
 └── README.md
 ```
@@ -215,7 +218,7 @@ DJI-Remote/
 
 ## 📜 Background
 
-This project started as a fork of [DJI-Remote](https://github.com/nicholaswilde/DJI-Remote) (ESP-IDF). The protocol was reverse-engineered from that codebase. The Arduino/LilyGoLib port was built from scratch to run on the T-Watch Ultra wristwatch.
+This project started as a fork of [DJI-Remote](https://github.com/nicholaswilde/DJI-Remote) (ESP-IDF). Its protocol research informed the Arduino/LilyGoLib implementation built for the T-Watch Ultra wristwatch. The original ESP-IDF firmware is no longer part of this repository.
 
 Use case: fishing from a boat — camera mounted on the boat, watch on wrist. One press starts recording, GPS coordinates are overlaid on the video in DJI Mimo, and the route is logged as a GPX track.
 
@@ -225,7 +228,7 @@ Use case: fishing from a boat — camera mounted on the boat, watch on wrist. On
 
 This project is licensed under the [**MIT License**](https://opensource.org/licenses/MIT). See [`LICENSE`](LICENSE).
 
-Third-party licenses (DJI, ESP-IDF, MIT legacy) are listed in [`THIRD_PARTY_NOTICES.md`](THIRD_PARTY_NOTICES.md).
+Third-party licenses and attribution are listed in [`THIRD_PARTY_NOTICES.md`](THIRD_PARTY_NOTICES.md).
 
 ## Support
 
