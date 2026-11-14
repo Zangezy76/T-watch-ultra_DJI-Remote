@@ -1,5 +1,7 @@
 # Build outputs
 /build
+/.arduino-build
+__pycache__/
 /managed_components
 /components
 /.cache
